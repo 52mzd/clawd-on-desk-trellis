@@ -42,6 +42,12 @@ const PLATFORM_ALIASES = {
   "kimi-cli": "kimi",
   pi: "pi",
   zcode: "claude",
+  // 10-18 specrune board: added WITH evidence (the conservative rule above
+  // satisfied) — SpecRune's DSH plugin writes
+  // .specrune/.runtime/sessions/dsh_<sanitized-session-id>.json; a real
+  // pointer file was observed in this very repo (clawd-on-desk's own
+  // migrated .specrune).
+  "deepseek-harness": "dsh",
 };
 
 // Port of _sanitize_key: collapse runs of disallowed chars to one "_",
@@ -104,9 +110,13 @@ function sessionPointerKey(agentId, sessionId) {
 // has left the implement phase for the check phase (workflow Phase 3 runs
 // quality checks before archive), so it reports "check" instead. Callers
 // that do not read implement.md simply omit it and get the legacy mapping.
+// 10-18 specrune board: SpecRune's write whitelist dropped "done" in favor
+// of "completed", but reads must keep tolerating the legacy value
+// (IsTerminalStatus treats done ≡ completed) — so a non-archived task.json
+// with status "done" maps to "finish", exactly like "completed".
 function derivePhase({ status, hasPrd, isArchived, implementChecklist } = {}) {
   if (isArchived) return "done";
-  if (status === "completed") return "finish";
+  if (status === "completed" || status === "done") return "finish";
   if (status === "in_progress") {
     if (
       implementChecklist

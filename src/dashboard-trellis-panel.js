@@ -58,6 +58,7 @@
           phase: null,
           progress: null,
           parent: null,
+          workflow: null,
           sessions: [],
         };
         byPath.set(taskPath, entry);
@@ -65,6 +66,12 @@
       }
       if (!entry.title && typeof info.title === "string" && info.title.trim()) {
         entry.title = info.title;
+      }
+      // First non-empty workflow wins (same policy as the title): the
+      // provenance of a task dir never changes. "specrune" badges the row;
+      // null keeps trellis rows unbadged (legacy shape).
+      if (!entry.workflow && info.workflow === "specrune") {
+        entry.workflow = "specrune";
       }
       // First non-empty parent wins (same policy as the title): the link is
       // written once by task.py and never moves for a given task dir.

@@ -20,9 +20,11 @@
 //   - none (no sessions, or no resolvable root) → next poll in 15s (backoff)
 //
 // Per-round IO budget (design D3, documented for reviewers):
-//   - root lookup: ≤8 stat per unique cwd, memoized per cwd (positives
-//     forever — a cwd does not move its .trellis root; negatives for 60s so
-//     a freshly `trellis init`-ed project is still picked up)
+//   - root lookup: ≤16 stat per unique cwd (8 climb levels × the two
+//     workflow dir names), memoized per cwd (positives
+//     forever — a cwd does not move its workflow root; negatives for 60s so
+//     a freshly `trellis init`-ed / `specrune init`-ed project is still
+//     picked up)
 //   - per session: 1 pointer readFile on exact-key hit; on miss +1 readdir
 //     of .runtime/sessions and (only with exactly one same-platform
 //     candidate filename) 1 more readFile — the fallback path
@@ -54,6 +56,26 @@ const CHILD_PROJECT_MAX = 32;
 const ROOT_NEGATIVE_TTL_MS = 60 * 1000;
 const FALLBACK_MAX_AGE_MS = 30 * 60 * 1000;
 const PARALLEL_COUNT_TTL_MS = 30 * 1000;
+
+// Workflow directory names recognized at a project root, in priority
+// order. SpecRune (.specrune) is a direct descendant of Trellis (.trellis)
+// with the same on-disk layout (tasks/<MM-DD-slug>/task.json, tasks/archive/
+// <YYYY-MM>/, .runtime/sessions pointers, spec/), so the whole read stack
+// below is workflow-agnostic: the resolved root path already carries the
+// directory name and everything joins relative to it. A project carrying
+// BOTH (mid-migration) resolves .trellis first — existing behavior never
+// shifts under a trellis project.
+const WORKFLOW_DIRS = [".trellis", ".specrune"];
+const WORKFLOW_DIR_NEGATIVE_TTL_MS = 60 * 1000;
+
+// workflow field for IPC payloads: "specrune" for .specrune roots, absent
+// for .trellis (legacy shape stays byte-identical — the renderer treats an
+// absent field as trellis).
+function workflowFromRootDir(root) {
+  return typeof root === "string" && path.basename(root) === ".specrune"
+    ? "specrune"
+    : null;
+}
 
 function toPosix(p) {
   return p.split(path.sep).join("/");
@@ -258,33 +280,73 @@ function createTrellisActivity(options) {
 
   // A registered project root resolves directly — no upward search, no
   // negative-TTL cache: the user picked this exact directory, and a missing
-  // .trellis simply answers empty lists (harmless) until they init one.
-  function persistedRootDir(cwd) {
-    return path.join(normalizeRootPath(cwd), ".trellis");
+  // workflow dir simply answers empty lists (harmless) until they init one.
+  // SpecRune support: the store keeps PROJECT roots for both workflow
+  // kinds, so the workflow directory under a registered root is resolved
+  // (and memoized) here. Positives are cached forever (a project does not
+  // move its workflow dir); negatives carry the same 60s TTL as the
+  // session-cwd root cache so a fresh `specrune init` is still picked up.
+  const workflowDirCache = new Map(); // normalized project root → { dir } | { dir: null, negativeUntil }
+
+  async function resolveWorkflowDir(projectRoot) {
+    const key = normalizeRootPath(projectRoot);
+    const nowMs = nowFn();
+    const cached = workflowDirCache.get(key);
+    if (cached) {
+      if (cached.dir) return cached.dir;
+      if (cached.negativeUntil > nowMs) return null;
+    }
+    let found = null;
+    for (const name of WORKFLOW_DIRS) {
+      const st = await statQuiet(path.join(key, name));
+      if (st && st.isDirectory()) {
+        found = name;
+        break;
+      }
+    }
+    workflowDirCache.set(
+      key,
+      found ? { dir: found } : { dir: null, negativeUntil: nowMs + WORKFLOW_DIR_NEGATIVE_TTL_MS }
+    );
+    return found;
   }
 
-  // Upward .trellis search for the add-root flow: returns the project root
-  // (parent of the .trellis dir) nearest to `dir`, or null when the picked
-  // directory has no .trellis at or above it. Mirrors findTrellisRoot's
-  // climb but is never cached — it runs once per explicit user action.
-  // Whether `dir` ITSELF contains a .trellis — no upward walk. Used by the
-  // explicit root picker where the user's choice is authoritative;
-  // resolveProjectRoot's upward search is for session cwds only (picking
-  // ~/Downloads/codes used to climb all the way to a stray ~/.trellis in
-  // $HOME and register the whole home as a root).
+  async function persistedRootDir(cwd) {
+    const normalized = normalizeRootPath(cwd);
+    const wf = await resolveWorkflowDir(normalized);
+    // No workflow dir (yet): answer the legacy .trellis path so callers
+    // keep the "harmless empty lists" contract for a registered root whose
+    // project has not initialized either tool.
+    return path.join(normalized, wf || WORKFLOW_DIRS[0]);
+  }
+
+  // Upward workflow-root search for the add-root flow: returns the project
+  // root (parent of the workflow dir) nearest to `dir`, or null when the
+  // picked directory has no workflow dir at or above it. Mirrors
+  // findTrellisRoot's climb but is never cached — it runs once per explicit
+  // user action. Whether `dir` ITSELF contains a workflow dir — no upward
+  // walk. Used by the explicit root picker where the user's choice is
+  // authoritative; resolveProjectRoot's upward search is for session cwds
+  // only (picking ~/Downloads/codes used to climb all the way to a stray
+  // ~/.trellis in $HOME and register the whole home as a root).
   async function isDirectProjectRoot(dir) {
     if (typeof dir !== "string" || !dir.trim()) return false;
-    const st = await statQuiet(path.join(path.normalize(dir), ".trellis"));
-    return !!(st && st.isDirectory());
+    const normalized = path.normalize(dir);
+    for (const name of WORKFLOW_DIRS) {
+      const st = await statQuiet(path.join(normalized, name));
+      if (st && st.isDirectory()) return true;
+    }
+    return false;
   }
 
   async function resolveProjectRoot(dir) {
     if (typeof dir !== "string" || !dir.trim()) return null;
     let cur = path.normalize(dir);
     for (let depth = 0; depth < ROOT_SEARCH_MAX_DEPTH; depth++) {
-      const candidate = path.join(cur, ".trellis");
-      const st = await statQuiet(candidate);
-      if (st && st.isDirectory()) return cur;
+      for (const name of WORKFLOW_DIRS) {
+        const st = await statQuiet(path.join(cur, name));
+        if (st && st.isDirectory()) return cur;
+      }
       const parent = path.dirname(cur);
       if (parent === cur) break;
       cur = parent;
@@ -292,10 +354,10 @@ function createTrellisActivity(options) {
     return null;
   }
 
-  // Direct children of `dir` that contain a .trellis — used when the user
-  // picks a parent folder holding several projects. Shallow by design (one
-  // readdir + one stat per child); capped so a giant home directory cannot
-  // fan out into hundreds of registrations.
+  // Direct children of `dir` that contain a workflow dir — used when the
+  // user picks a parent folder holding several projects. Shallow by design
+  // (one readdir + ≤2 stat per child); capped so a giant home directory
+  // cannot fan out into hundreds of registrations.
   async function listChildProjectRoots(dir) {
     if (typeof dir !== "string" || !dir.trim()) return [];
     let names;
@@ -312,9 +374,14 @@ function createTrellisActivity(options) {
       if (typeof name !== "string" || !name || name.startsWith(".")) continue;
       const isDirEntry = typeof entry === "string" ? true : entry.isDirectory();
       if (!isDirEntry) continue;
-      const child = path.join(path.normalize(dir), entry.name);
-      const st = await statQuiet(path.join(child, ".trellis"));
-      if (st && st.isDirectory()) roots.push(child);
+      const child = path.join(path.normalize(dir), name);
+      for (const wfName of WORKFLOW_DIRS) {
+        const st = await statQuiet(path.join(child, wfName));
+        if (st && st.isDirectory()) {
+          roots.push(child);
+          break;
+        }
+      }
       if (roots.length >= CHILD_PROJECT_MAX) break;
     }
     return roots;
@@ -402,15 +469,17 @@ function createTrellisActivity(options) {
     }
     let dir = path.normalize(cwd);
     for (let depth = 0; depth < ROOT_SEARCH_MAX_DEPTH; depth++) {
-      const candidate = path.join(dir, ".trellis");
-      const st = await statQuiet(candidate);
-      if (st && st.isDirectory()) {
-        rootCache.set(cwd, { root: candidate });
-        // Fire-and-forget discovery; a throw must never break the lookup.
-        if (onRootDiscovered) {
-          try { onRootDiscovered(candidate); } catch {}
+      for (const name of WORKFLOW_DIRS) {
+        const candidate = path.join(dir, name);
+        const st = await statQuiet(candidate);
+        if (st && st.isDirectory()) {
+          rootCache.set(cwd, { root: candidate });
+          // Fire-and-forget discovery; a throw must never break the lookup.
+          if (onRootDiscovered) {
+            try { onRootDiscovered(candidate); } catch {}
+          }
+          return candidate;
         }
-        return candidate;
       }
       const parent = path.dirname(dir);
       if (parent === dir) break;
@@ -651,6 +720,10 @@ function createTrellisActivity(options) {
     };
     if (task.nextStep) info.nextStep = task.nextStep;
     if (task.parent) info.parent = task.parent;
+    // SpecRune provenance: .specrune roots mark their bindings so the HUD /
+    // Dashboard can badge them; .trellis stays absent (legacy shape).
+    const workflow = workflowFromRootDir(root);
+    if (workflow) info.workflow = workflow;
     // Process-level hints (09-27): absent trace → absent fields → the HUD
     // renders exactly as before.
     const trace = traceReads ? await readSessionTrace(session, traceReads) : null;
@@ -830,8 +903,8 @@ function createTrellisActivity(options) {
   // cannot jitter phase badges or celebrations.
   //
   // taskPath is the snapshot-relative posix path (".trellis/tasks/<name>"
-  // for a live task, ".trellis/tasks/archive/<month>/<name>" for one that
-  // already moved). Results:
+  // or ".specrune/tasks/<name>" for a live task, ".../tasks/archive/
+  // <month>/<name>" for one that already moved). Results:
   //   { status: "ok", task: { title, phase, rawStatus, createdAt,
   //                           completedAt, archived, checklist, docs } }
   //   { status: "missing" }          — no root / task dir nowhere on disk
@@ -839,7 +912,14 @@ function createTrellisActivity(options) {
   // docs lists the task dir's *.md files (name + byte size) so the card can
   // offer one tab per document; contents are read separately, one doc at a
   // time, by readTaskDoc.
-  const TASK_DETAIL_PREFIX = ".trellis/tasks/";
+  const TASK_DETAIL_PREFIXES = WORKFLOW_DIRS.map((name) => `${name}/tasks/`);
+
+  function taskDetailPrefixLength(taskPath) {
+    for (const prefix of TASK_DETAIL_PREFIXES) {
+      if (taskPath.startsWith(prefix)) return prefix.length;
+    }
+    return 0;
+  }
 
   // Shared path resolution for the on-demand detail/doc reads: validates
   // the trusted cwd + the renderer-supplied taskPath (prefix + per-segment
@@ -847,7 +927,8 @@ function createTrellisActivity(options) {
   // active→archive fallback. Returns { absDir, archived } or null.
   async function resolveTaskDir(cwd, taskPath) {
     if (typeof cwd !== "string" || !cwd.trim()) return null;
-    if (typeof taskPath !== "string" || !taskPath.startsWith(TASK_DETAIL_PREFIX)) {
+    const prefixLength = typeof taskPath === "string" ? taskDetailPrefixLength(taskPath) : 0;
+    if (!prefixLength) {
       return null;
     }
     // Only a cwd a live trellis-capable session is working in, one that
@@ -859,7 +940,7 @@ function createTrellisActivity(options) {
     // Split on BOTH separators before validating: on win32 path.join
     // normalizes backslash segments too, so a "/"-only split would let
     // ".trellis/tasks/a\..\..\x" join outside the root.
-    const segments = taskPath.slice(TASK_DETAIL_PREFIX.length).split(/[\\/]/);
+    const segments = taskPath.slice(prefixLength).split(/[\\/]/);
     // Path containment: the renderer supplies this string, so traversal
     // segments must be rejected before they ever reach path.join.
     if (!segments.length || segments.some((s) => !s || s === "." || s === "..")) {
@@ -867,6 +948,10 @@ function createTrellisActivity(options) {
     }
     const root = await findTrellisRoot(cwd);
     if (!root) return null;
+    // The taskPath prefix must name the SAME workflow dir the root
+    // resolved to — a .trellis/tasks/ path never opens a .specrune tree
+    // and vice versa (taskPath is snapshot-relative to its own root).
+    if (!taskPath.startsWith(`${path.basename(root)}/tasks/`)) return null;
 
     let absDir = path.join(root, "tasks", ...segments);
     let archived = segments[0] === "archive";
@@ -883,7 +968,7 @@ function createTrellisActivity(options) {
       absDir = archivedDir;
       archived = true;
     }
-    return { absDir, archived };
+    return { absDir, archived, root };
   }
 
   async function readTaskDetail(cwd, taskPath) {
@@ -905,10 +990,12 @@ function createTrellisActivity(options) {
       ? completedRealStat.mtimeMs
       : null;
     const checklist = await readChecklist(absDir);
+    const workflow = workflowFromRootDir(resolved.root);
     return {
       status: "ok",
       task: {
         title: pickTitle(value, absDir),
+        ...(workflow ? { workflow } : {}),
         phase: derivePhase({
           status: value.status,
           hasPrd,
@@ -1054,11 +1141,15 @@ function createTrellisActivity(options) {
       const bare = relPath.slice(relPath.lastIndexOf("/") + 1);
       return {
         relPath,
-        full: `.trellis/spec/${relPath}`,
+        // Citations may name either workflow prefix (a .specrune project's
+        // docs can quote a .trellis path and vice versa); both count.
+        fulls: WORKFLOW_DIRS.map((name) => `${name}/spec/${relPath}`),
         bare: nameCounts.get(bare) === 1 ? bare : null,
       };
     });
-    const tasksDir = path.join(root, ".trellis", "tasks");
+    const wfDir = await resolveWorkflowDir(root);
+    if (!wfDir) return counts;
+    const tasksDir = path.join(root, wfDir, "tasks");
     const queue = [{ rel: "", depth: 0 }];
     let scanned = 0;
     let bytes = 0;
@@ -1076,7 +1167,10 @@ function createTrellisActivity(options) {
           scanned += 1;
           bytes += text.length;
           for (const needle of needles) {
-            if (text.includes(needle.full) || (needle.bare && text.includes(needle.bare))) {
+            if (
+              needle.fulls.some((full) => text.includes(full))
+              || (needle.bare && text.includes(needle.bare))
+            ) {
               counts.set(needle.relPath, (counts.get(needle.relPath) || 0) + 1);
             }
           }
@@ -1088,16 +1182,20 @@ function createTrellisActivity(options) {
     return counts;
   }
 
-  function resolveTrustedSpecDir(root) {
+  async function resolveTrustedSpecDir(root) {
     if (typeof root !== "string" || !root.trim()) return null;
     if (!isTrustedTrellisCwd(root)) return null;
-    const specDir = path.join(root, ".trellis", "spec");
+    // Missing workflow dir (registered root, project not initialized):
+    // keep the "harmless empty lists" contract — answer the legacy
+    // .trellis path whose readdir comes back empty.
+    const wfDir = (await resolveWorkflowDir(root)) || WORKFLOW_DIRS[0];
+    const specDir = path.join(root, wfDir, "spec");
     const normalizedRoot = normalizeRootPath(root);
-    return { specDir, normalizedRoot };
+    return { specDir, normalizedRoot, wfDir };
   }
 
   async function readSpecTree(root) {
-    const resolved = resolveTrustedSpecDir(root);
+    const resolved = await resolveTrustedSpecDir(root);
     if (!resolved) return { status: "missing" };
     const files = [];
     // Iterative walk, one directory queue entry at a time; file order is
@@ -1147,7 +1245,7 @@ function createTrellisActivity(options) {
   // only be read if the directory just said it exists) — traversal never
   // reaches path.join.
   async function readSpecDoc(root, relPath) {
-    const resolved = resolveTrustedSpecDir(root);
+    const resolved = await resolveTrustedSpecDir(root);
     if (!resolved) return { status: "missing" };
     if (
       typeof relPath !== "string"
@@ -1198,11 +1296,20 @@ function createTrellisActivity(options) {
   const NETWORK_REF_MAX = 20;
 
   function taskRefPathFromAbs(absTaskDir) {
-    const marker = `${path.sep}.trellis${path.sep}`;
-    const idx = absTaskDir.lastIndexOf(marker);
-    if (idx === -1) return null;
-    // Keep the leading ".trellis/" — the detail channel's taskPath prefix.
-    return absTaskDir.slice(idx + 1).split(path.sep).join("/");
+    // Keep the leading workflow dir (".<name>/") — the detail channel's
+    // taskPath prefix. Both markers are probed; the later occurrence wins
+    // (deepest path wins when both appear, matching lastIndexOf semantics).
+    let best = -1;
+    let bestMarkerLen = 0;
+    for (const name of WORKFLOW_DIRS) {
+      const idx = absTaskDir.lastIndexOf(`${path.sep}${name}${path.sep}`);
+      if (idx > best) {
+        best = idx;
+        bestMarkerLen = name.length + 1; // +1: the leading separator
+      }
+    }
+    if (best === -1) return null;
+    return absTaskDir.slice(best + 1).split(path.sep).join("/");
   }
 
   // ── v7 R8 project-wide network overview ───────────
@@ -1212,9 +1319,12 @@ function createTrellisActivity(options) {
   // shared-spec/shared-PRD horizontal groups as the single-task network.
   // Caps: ≤NETWORK_SIBLING_MAX task dirs, ≤SPEC_REF_MAX_BYTES doc text.
   async function readTaskNetworkOverview(root) {
-    const specResolved = resolveTrustedSpecDir(root);
+    const specResolved = await resolveTrustedSpecDir(root);
     if (!specResolved) return { status: "missing" };
-    const tasksDir = path.join(specResolved.normalizedRoot, ".trellis", "tasks");
+    // Node taskPaths use the root's actual workflow dir so detail-channel
+    // prefix validation and renderer prefix checks both match.
+    const wfDir = specResolved.wfDir;
+    const tasksDir = path.join(specResolved.normalizedRoot, wfDir, "tasks");
     const dirEntries = await readdirQuiet(tasksDir);
     if (!dirEntries) return { status: "missing" };
 
@@ -1250,14 +1360,14 @@ function createTrellisActivity(options) {
 
     for (const name of dirEntries) {
       if (name.startsWith(".") || MONTH_DIR_PATTERN.test(name)) continue;
-      await visit(path.join(tasksDir, name), `.trellis/tasks/${name}`, false);
+      await visit(path.join(tasksDir, name), `${wfDir}/tasks/${name}`, false);
     }
     const archiveDir = path.join(tasksDir, "archive");
     for (const month of (await readdirQuiet(archiveDir)) || []) {
       if (!MONTH_DIR_PATTERN.test(month)) continue;
       for (const name of (await readdirQuiet(path.join(archiveDir, month))) || []) {
         if (name.startsWith(".")) continue;
-        await visit(path.join(archiveDir, month, name), `.trellis/tasks/archive/${month}/${name}`, true);
+        await visit(path.join(archiveDir, month, name), `${wfDir}/tasks/archive/${month}/${name}`, true);
       }
     }
 
@@ -1288,7 +1398,16 @@ function createTrellisActivity(options) {
     }
 
     // Horizontal edges: same needles as the single-task scan, grouped
-    // across the whole root. Spec groups need ≥2 distinct citers.
+    // across the whole root. Citations may name either workflow prefix;
+    // targets normalize to THIS root's wfDir so they join the node set.
+    // Spec groups need ≥2 distinct citers.
+    const WF_ALT = `(?:${WORKFLOW_DIRS.map((n) => n.replace(".", "\\.")).join("|")})`;
+    const SPEC_CITE_RE = new RegExp(WF_ALT + "/spec/([^\\s\"'`<>)]+?\\.md)", "g");
+    const PRD_ARCHIVE_CITE_RE = new RegExp(
+      WF_ALT + "/tasks/archive/(\\d{4}-\\d{2})/([^\\s\"'`<>)\\/]+)/prd\\.md",
+      "g"
+    );
+    const PRD_CITE_RE = new RegExp(WF_ALT + "/tasks/([^\\s\"'`<>)\\/]+)/prd\\.md", "g");
     const ref = (taskPath) => {
       const node = nodeByTaskPath.get(taskPath);
       return {
@@ -1304,19 +1423,19 @@ function createTrellisActivity(options) {
     for (const { taskPath, text } of docTexts) {
       bytes += text.length;
       if (bytes > SPEC_REF_MAX_BYTES) { truncated = true; break; }
-      for (const m of text.matchAll(/\.trellis\/spec\/([^\s"'`<>)]+?\.md)/g)) {
+      for (const m of text.matchAll(SPEC_CITE_RE)) {
         if (!specHits.has(m[1])) specHits.set(m[1], []);
         specHits.get(m[1]).push(taskPath);
       }
-      for (const m of text.matchAll(/\.trellis\/tasks\/archive\/(\d{4}-\d{2})\/([^\s"'`<>)\/]+)\/prd\.md/g)) {
-        const target = `.trellis/tasks/archive/${m[1]}/${m[2]}`;
+      for (const m of text.matchAll(PRD_ARCHIVE_CITE_RE)) {
+        const target = `${wfDir}/tasks/archive/${m[1]}/${m[2]}`;
         if (target !== taskPath) {
           if (!prdHits.has(target)) prdHits.set(target, []);
           prdHits.get(target).push(taskPath);
         }
       }
-      for (const m of text.matchAll(/\.trellis\/tasks\/([^\s"'`<>)\/]+)\/prd\.md/g)) {
-        const target = `.trellis/tasks/${m[1]}`;
+      for (const m of text.matchAll(PRD_CITE_RE)) {
+        const target = `${wfDir}/tasks/${m[1]}`;
         if (target !== taskPath) {
           if (!prdHits.has(target)) prdHits.set(target, []);
           prdHits.get(target).push(taskPath);
@@ -1370,7 +1489,7 @@ function createTrellisActivity(options) {
     const rootToCwd = new Map();
     for (const cwd of collectKnownRootCwds()) {
       if (persistedRoots.has(normalizeRootPath(cwd))) {
-        const root = persistedRootDir(cwd);
+        const root = await persistedRootDir(cwd);
         if (!rootToCwd.has(root)) rootToCwd.set(root, cwd);
         continue;
       }
@@ -1381,7 +1500,7 @@ function createTrellisActivity(options) {
     const merged = [];
     for (const [root, cwd] of rootToCwd) {
       for (const entry of listArchivedTasks(syncFs, path.join(root, "tasks", "archive"))) {
-        merged.push({ entry, cwd });
+        merged.push({ entry, cwd, wfDir: path.basename(root) });
       }
     }
     merged.sort((a, b) => {
@@ -1393,13 +1512,13 @@ function createTrellisActivity(options) {
       return bm - am;
     });
 
-    const tasks = merged.slice(0, ARCHIVE_LIST_MAX).map(({ entry, cwd }) => {
+    const tasks = merged.slice(0, ARCHIVE_LIST_MAX).map(({ entry, cwd, wfDir }) => {
       const createdAtMs = entry.createdAt !== null ? Date.parse(entry.createdAt) : NaN;
       const diff = entry.completedAtMs !== null && Number.isFinite(createdAtMs)
         ? entry.completedAtMs - createdAtMs
         : NaN;
       return {
-        taskPath: `.trellis/tasks/archive/${entry.month}/${entry.name}`,
+        taskPath: `${wfDir}/tasks/archive/${entry.month}/${entry.name}`,
         title: entry.title || entry.name,
         parent: entry.parent,
         hasChildren: entry.hasChildren === true,
@@ -1410,6 +1529,7 @@ function createTrellisActivity(options) {
         completedAtRealMs: entry.completedAtRealMs,
         durationMs: Number.isFinite(diff) && diff > 0 ? diff : null,
         cwd,
+        ...(wfDir === ".specrune" ? { workflow: "specrune" } : {}),
       };
     });
     return { status: "ok", tasks };
@@ -1432,6 +1552,7 @@ function createTrellisActivity(options) {
   // panel both walk it — one traversal, two consumers).
   async function collectActiveTasksInRoot(root, cwd) {
     const projectRoot = path.dirname(root);
+    const workflow = workflowFromRootDir(root);
     const entries = await readdirQuiet(path.join(root, "tasks"));
     if (!entries) return [];
     const out = [];
@@ -1448,6 +1569,7 @@ function createTrellisActivity(options) {
         hasChildren: info.hasChildren === true,
         priority: info.priority || null,
         cwd,
+        ...(workflow ? { workflow } : {}),
       };
       if (info.nextStep) task.nextStep = info.nextStep;
       out.push(task);
@@ -1463,7 +1585,7 @@ function createTrellisActivity(options) {
     const seenRoots = new Set();
     for (const cwd of collectKnownRootCwds()) {
       const isPersisted = persistedRoots.has(normalizeRootPath(cwd));
-      const root = isPersisted ? persistedRootDir(cwd) : await findTrellisRoot(cwd);
+      const root = isPersisted ? await persistedRootDir(cwd) : await findTrellisRoot(cwd);
       if (!root || seenRoots.has(root)) continue;
       seenRoots.add(root);
       resolved.push({ root, cwd });
@@ -1500,7 +1622,7 @@ function createTrellisActivity(options) {
     const roots = [];
     if (typeof anchorCwd === "string" && anchorCwd.trim() && isTrustedTrellisCwd(anchorCwd)) {
       const anchorRoot = persistedRoots.has(normalizeRootPath(anchorCwd))
-        ? persistedRootDir(anchorCwd)
+        ? await persistedRootDir(anchorCwd)
         : await findTrellisRoot(anchorCwd);
       if (anchorRoot) {
         seenRoots.add(anchorRoot);
@@ -1509,7 +1631,7 @@ function createTrellisActivity(options) {
     }
     for (const cwd of collectKnownRootCwds()) {
       const root = persistedRoots.has(normalizeRootPath(cwd))
-        ? persistedRootDir(cwd)
+        ? await persistedRootDir(cwd)
         : await findTrellisRoot(cwd);
       if (!root || seenRoots.has(root)) continue;
       seenRoots.add(root);
@@ -1543,7 +1665,7 @@ function createTrellisActivity(options) {
           })
           .slice(0, HUD_PANEL_ARCHIVE_MAX)
           .map((entry) => ({
-            taskPath: `.trellis/tasks/archive/${entry.month}/${entry.name}`,
+            taskPath: `${path.basename(root)}/tasks/archive/${entry.month}/${entry.name}`,
             title: entry.title || entry.name,
             completedAt: entry.completedAt,
           }))
@@ -1609,10 +1731,16 @@ function createTrellisActivity(options) {
   // has not been polled (no bound session yet) or nothing is active.
   function getByProject(projectPath) {
     if (typeof projectPath !== "string" || !projectPath.trim()) return null;
-    const root = path.join(path.normalize(projectPath), ".trellis");
-    const cached = parallelCache.get(root);
-    if (!cached || !Array.isArray(cached.activeTasks) || cached.activeTasks.length === 0) return null;
-    return cached.activeTasks.map((task) => ({ title: task.title, phase: task.phase }));
+    const normalized = path.normalize(projectPath);
+    // The parallel-cache keys are resolved workflow roots; probe both dir
+    // names (a .specrune project's summary lives under its own root).
+    for (const name of WORKFLOW_DIRS) {
+      const cached = parallelCache.get(path.join(normalized, name));
+      if (cached && Array.isArray(cached.activeTasks) && cached.activeTasks.length > 0) {
+        return cached.activeTasks.map((task) => ({ title: task.title, phase: task.phase }));
+      }
+    }
+    return null;
   }
 
   return {

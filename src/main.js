@@ -5582,13 +5582,17 @@ registerSessionIpc({
     const roots = _trellisRootsStore.list();
     const picks = _trellisRootsStore.listPicks();
     let recencies = null;
+    // 10-18 specrune board: a registered project root may carry either
+    // workflow dir — probe both and take the freshest signal (a missing
+    // root answers 0 inside readRootRecencies, so the max is safe).
+    const workflowRootsOf = (root) => [".trellis", ".specrune"].map((name) => path.join(root, name));
     if (_trellisActivity && typeof _trellisActivity.readRootRecencies === "function") {
       recencies = await _trellisActivity.readRootRecencies(
-        roots.map((root) => path.join(root, ".trellis"))
+        roots.flatMap(workflowRootsOf)
       ).catch(() => null);
     }
     if (!recencies) return { status: "ok", roots, picks };
-    const rec = (root) => recencies.get(path.join(root, ".trellis")) || 0;
+    const rec = (root) => Math.max(0, ...workflowRootsOf(root).map((wf) => recencies.get(wf) || 0));
     const sortedRoots = [...roots].sort((a, b) => rec(b) - rec(a));
     const sortedPicks = picks
       .map((pick) => ({ pick, max: Math.max(0, ...pick.roots.map(rec)) }))

@@ -473,7 +473,10 @@ function registerSessionIpc(options = {}) {
       || typeof payload.cwd !== "string"
       || !payload.cwd
       || typeof payload.taskPath !== "string"
-      || (payload.taskPath !== "" && !payload.taskPath.startsWith(".trellis/tasks/"))
+      // 10-18 specrune board: taskPaths may prefix either workflow dir.
+      || (payload.taskPath !== ""
+        && !payload.taskPath.startsWith(".trellis/tasks/")
+        && !payload.taskPath.startsWith(".specrune/tasks/"))
     ) {
       return; // send channel: reject silently — "" means "just open the view"
     }

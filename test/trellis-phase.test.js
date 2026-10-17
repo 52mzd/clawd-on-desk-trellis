@@ -113,8 +113,7 @@ describe("trellis-phase PLATFORM_ALIASES / trellisPlatformFor", () => {
       "workbuddy",
       "traecode",
       "grok-build",
-      "deepseek-harness",
-    ]) {
+    ] ) {
       assert.strictEqual(trellisPlatformFor(agentId), null, agentId);
     }
     assert.strictEqual(trellisPlatformFor("unknown-agent"), null);
@@ -122,8 +121,20 @@ describe("trellis-phase PLATFORM_ALIASES / trellisPlatformFor", () => {
     assert.strictEqual(trellisPlatformFor(null), null);
   });
 
+  it("maps deepseek-harness onto dsh (10-18 specrune board, real pointer evidence)", () => {
+    // Actual file on disk in this repo's own migrated .specrune:
+    // .specrune/.runtime/sessions/dsh_session-363694cf-98c8-4adb-88b2-170ed32ccc05.json
+    // with in-file platform "dsh" — the DSH plugin names pointers after the
+    // raw harness session id ("session-<uuid>", no agent prefix).
+    assert.strictEqual(trellisPlatformFor("deepseek-harness"), "dsh");
+    assert.strictEqual(
+      sessionPointerKey("deepseek-harness", "session-363694cf-98c8-4adb-88b2-170ed32ccc05"),
+      "dsh_session-363694cf-98c8-4adb-88b2-170ed32ccc05"
+    );
+  });
+
   it("keeps the alias table in sync with the exported constant", () => {
-    assert.strictEqual(Object.keys(PLATFORM_ALIASES).length, 12);
+    assert.strictEqual(Object.keys(PLATFORM_ALIASES).length, 13);
   });
 });
 

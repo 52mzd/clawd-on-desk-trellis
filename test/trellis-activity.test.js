@@ -869,7 +869,7 @@ describe("trellis-activity gating & backoff", () => {
     assert.strictEqual(h.activity.getTrellisInfo("pi:late").phase, "execute");
   });
 
-  it("stops polling at the root-search depth bound (≤8 stat probes)", async () => {
+  it("stops polling at the root-search depth bound (≤16 stat probes: 8 levels × 2 workflow dirs)", async () => {
     const deepCwd = path.resolve("/a/b/c/d/e/f/g/h/i/j/deep");
     const h = makeHarness({
       sessions: new Map([["pi:mine", { agentId: "pi", cwd: deepCwd }]]),
@@ -877,7 +877,10 @@ describe("trellis-activity gating & backoff", () => {
     h.activity.start();
     await h.timers.runDue();
 
-    assert.strictEqual(h.fakeFs.readOps.stat, 8);
+    // 10-18 specrune board: each climb level now probes .trellis AND
+    // .specrune, doubling the fully-negative budget (documented in the
+    // module header's per-round IO budget).
+    assert.strictEqual(h.fakeFs.readOps.stat, 16);
     assert.strictEqual(h.activity.getTrellisInfo("pi:mine"), null);
   });
 });

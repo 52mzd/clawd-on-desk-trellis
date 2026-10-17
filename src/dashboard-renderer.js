@@ -1280,6 +1280,14 @@ function createTrellisTaskRow(groupRow) {
   const badge = TRELLIS_PHASE_BADGE[task.phase];
   const phaseEl = createText("span", `trellis-phase-badge ${badge.cls}`, t(badge.labelKey));
   main.appendChild(phaseEl);
+  // 10-18 specrune board: SpecRune-provenance tasks carry a small badge so
+  // mixed .trellis/.specrune boards read at a glance. Trellis tasks stay
+  // unbadged (the default provenance needs no marker).
+  if (task.workflow === "specrune") {
+    const wf = createText("span", "trellis-workflow-badge", t("dashboardTrellisSpecruneBadge"));
+    wf.title = t("dashboardTrellisSpecruneBadge");
+    main.appendChild(wf);
+  }
 
   // A parent row with live children shows the subtree summary instead of
   // its own step count (the group is what the row now answers for);
@@ -2037,6 +2045,13 @@ function buildTrellisSplitRow(task, meta, labels, archived = false) {
   const titleEl = createText("span", "trellis-split-row-title", titleText);
   titleEl.title = titleText;
   headRow.appendChild(titleEl);
+  // 10-18 specrune board: provenance badge rides the title line (same
+  // placement as the session-panel row's phase-adjacent badge).
+  if (task.workflow === "specrune") {
+    const wf = createText("span", "trellis-workflow-badge", t("dashboardTrellisSpecruneBadge"));
+    wf.title = t("dashboardTrellisSpecruneBadge");
+    headRow.appendChild(wf);
+  }
   main.appendChild(headRow);
   const subBits = [];
   if (task.sessions && task.sessions.length > 0) {
