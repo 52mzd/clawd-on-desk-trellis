@@ -6,6 +6,9 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { execFileSync } = require("node:child_process");
 
+// Lookups normalize to lowercase, so a `1+8=9@users.noreply.github.com`
+// identity such as `223556219+Copilot@...` cannot slip past an exclusion
+// written in lowercase.
 const IDENTITY_OVERRIDES = new Map(Object.entries({
   "rullerzhou@gmail.com": null,
   "228746293+rullerzhou-afk@users.noreply.github.com": null,
@@ -60,7 +63,104 @@ const IDENTITY_OVERRIDES = new Map(Object.entries({
   // 10-02 upstream sync: the fork export line picked up 974e863e (stale
   // wizard callbacks) authored under the maintainer's other machine profile.
   "sean.qiu@neptune-robotics.com": null,
+  // ── 上游 v1.3.0 同步补充 ──
+  // 归属来源：merge commit 的 fork owner、PR 作者（GitHub API）、
+  // 与贡献墙 handle 完全一致的作者名、或同一提交的 co-author。
+  "jyh19310302@gmail.com": "yunho09",
+  "joel.suazo@is-c.cl": "integrasoft-c",
+  "ys111165542@outlook.com": "sLingli",
+  "915885014@qq.com": "He-wei-gui",
+  "3210102172@zju.edu.cn": "JesmonX",
+  "yanqilu1997@126.com": "lurui1997",
+  "kkiritoliu@tencent.com": "kkirito16",
+  "yike001@e.ntu.edu.sg": "Yike-Ye",
+  "ghdwls0704@gmail.com": "Tonic-Jin",
+  "jason_zhihao@outlook.com": "JasonZH6600",
+  "quantai520@outlook.com": "quantai1314",
+  "1143409869@qq.com": "IatomicreactorI",
+  "deming.zhao@bsbit.com.cn": "zhaoxv210",
+  "976758426@qq.com": "serenNan",
+  "1018995004@qq.com": "zxypro1",
+  "rebootcrab@gmail.com": "rebootcrab-blip",
+  "cod3hulk@gmail.com": "cod3hulk",
+  "m0_54674331@noreply.gitcode.com": "lxgxhsy",
+  "czh666nb@gmail.com": "Bynlk",
+  "lyx15532388343@163.com": "ustin-star",
+  "zxypro@zxyprodemacbook-air.local": "zxypro1",
+  "2722273242@qq.com": "QingXB",
+  "neroayase@gmail.com": "NeroAyase",
+  "openclaw@agent.local": "29206394",
+  "zhouxinyu3@huawei.com": "divergentD",
+  "136696700@qq.com": "nmsn",
+  "xiyoumc.dev@gmail.com": "xiyouMc",
+  "zhengru@micous.com": "Rladmsrl",
+  "zhengxiangzxxx@163.com": "XiangZheng2002",
+  "me@pan93.com": "pan93412",
+  "keiyoshinaga@keis-macbook-air-2.local": "keiyo118",
+  "hwasowl598@gmail.com": "Hwasowl",
+  "tatsuya.nakano@garoinc.jp": "tatsuyanakanogaroinc",
+  "lsy3237@gmail.com": "yeonhub",
+  "yang.sun.liu@gmail.com": "ssly",
+  "liziqiangrui@hotmail.com": "stickycandy",
+  "txie@cn.roblox.com": "TaoXieSZ",
+  "liziqiang@corp.netease.com": "stickycandy",
+  "yu.jiachen@outlook.com": "yujiachen-y",
+  "geekweilai@gmail.com": "NeizhiTouhu",
+  "zhangzhengtian02@meituan.com": "androidZzT",
+  "xu3stones@xu3stonesdembp.lan": "xu3stones-cmd",
+  "jasonhonghh@gmail.com": "Jasonhonghh",
+  "2744423541@qq.com": "Jasonhonghh",
+  "crashchen@gmail.com": "crashchen",
+  "jialun.jiang@sap.com": "Tobeabellwether",
+  "purefkh@gmail.com": "purefkh",
+  "metazyf@gmail.com": "PixelCookie-zyf",
+  "3516988334@qq.com": "git-creat7",
+  "200203syttt@gmail.com": "schlaflied",
+  "undownding@gmail.com": "undownding",
+  "stevenchenworking@gmail.com": "godlockin",
+  "georgechan233@163.com": "ne9roni",
+  "linnin233@163.com": "linnin233",
+  "jth8854@gmail.com": "taehwanis",
+  "wujian.mailbox@gmail.com": "joshua-wu",
+  "hongsaygio.com@gmail.com": "tomaioo",
+  "tuananhtrinh919@gmail.com": "anhtrinh919",
+  "1658378516@qq.com": "tvpoet",
+  "seoki180@naver.com": "seoki180",
+  "s.c.haynes@rgu.ac.uk": "sophie-haynes",
+  "timmy.mi.private@gmail.com": "intimmydate",
+  "yanguibao@jtexpress.com": "yanguibao1997",
+  "pan93412@gmail.com": "pan93412",
+  "sefuzhou770801@gmail.com": "sefuzhou770801-hub",
+  "taoxie@taoxiedemac-mini-3.local": "taoxiesz",
+  "roy747423@163.com": "royhuang91",
+  "catan.marin@gmail.com": "sunnysonx",
+  "ajb459684460@gmail.com": "Ziy1-Tan",
+  "tanziyi0925@gmail.com": "Ziy1-Tan",
+  "mail@bzr.ink": "Rladmsrl",
+  "vadim.demkiv@gmail.com": "v-avuso",
+  "akaps6768@gmail.com": "zeus6768",
+  "alvinlog@kaist.ac.kr": "JaeHyeon-KAIST",
+  "joshuawu.wujian@alibaba-inc.com": "joshua-wu",
+  "elior513030@gmail.com": "YuChenYunn",
+  // 排除：AI 工具署名与无 GitHub 账号的 co-author。
+  "moonshot@moonshotdemacbook-pro.local": null,
+  "223556219+copilot@users.noreply.github.com": null,
+  "copilot@users.noreply.github.com": null,
+  "175728472+copilot@users.noreply.github.com": null,
+  "codex@openai.com": null,
+  "noreply@google.com": null,
+  "user@example.com": null,
+  "sabinabd@amazon.com": null,
+  "wenkangqiang.wkq@alibaba-inc.com": null,
 }));
+
+for (const [email, handle] of [...IDENTITY_OVERRIDES]) {
+  const normalized = email.toLowerCase();
+  if (normalized !== email) {
+    IDENTITY_OVERRIDES.delete(email);
+    if (!IDENTITY_OVERRIDES.has(normalized)) IDENTITY_OVERRIDES.set(normalized, handle);
+  }
+}
 
 function parseVersion(value) {
   const match = String(value || "").match(/^v?(\d+)\.(\d+)\.(\d+)(?:-|$)/);
