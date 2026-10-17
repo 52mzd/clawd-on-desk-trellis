@@ -37,6 +37,8 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
+const DESKTOP_DISCOVERY_NOT_FOUND = Object.freeze({ status: "not-found", appRoot: null, launcherPath: null, staticVersion: null, checkedPaths: [], reason: null });
+
 function listCleanupBackups(dir) {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).filter((name) => name.includes(".clawd-cleanup-") && name.endsWith(".bak"));
@@ -82,6 +84,8 @@ describe("cleanupIntegrations", () => {
     assert.strictEqual(plan.env.DSH_HOME, path.resolve(path.join(os.tmpdir(), "admin-dsh")));
     assert.strictEqual(plan.byAgent["deepseek-harness"].dshHome, plan.env.DSH_HOME);
     assert.strictEqual(plan.byAgent["deepseek-harness"].env.DSH_HOME, plan.env.DSH_HOME);
+    assert.strictEqual(plan.env.KIROCREW_HOME, undefined);
+    assert.strictEqual(plan.byAgent.kirocrew.hooksPath, path.join(homeDir, ".kiro", "crew", "hooks.json"));
     assert.strictEqual(plan.byAgent.hermes.env.LOCALAPPDATA, targetLocalAppData);
     assert.notStrictEqual(plan.byAgent.hermes.hermesHome, path.join(inheritedLocalAppData, "hermes"));
   });
@@ -102,6 +106,39 @@ describe("cleanupIntegrations", () => {
       resolveDshManagedRoot(plan.byAgent["deepseek-harness"]),
       resolveDshManagedRoot(defaultPlan.byAgent["deepseek-harness"]),
     );
+  });
+
+  it("honors KIROCREW_HOME for current-home cleanup and isolates alternate-home cleanup", () => {
+    const customHome = path.join(os.tmpdir(), "clawd-kirocrew-custom-home");
+    const currentHome = buildCleanupOptionsForHome(null, {
+      env: { HOME: os.homedir(), USERPROFILE: os.homedir(), KIROCREW_HOME: customHome },
+    });
+    assert.strictEqual(currentHome.env.KIROCREW_HOME, customHome);
+    assert.strictEqual(currentHome.byAgent.kirocrew.hooksPath, path.join(customHome, "hooks.json"));
+
+    const alternateHome = path.join(os.tmpdir(), "clawd-kirocrew-alternate-home");
+    const inherited = process.env.KIROCREW_HOME;
+    process.env.KIROCREW_HOME = customHome;
+    let isolated;
+    try {
+      isolated = buildCleanupOptionsForHome(alternateHome);
+    } finally {
+      if (inherited === undefined) delete process.env.KIROCREW_HOME;
+      else process.env.KIROCREW_HOME = inherited;
+    }
+    assert.strictEqual(isolated.env.KIROCREW_HOME, undefined);
+    assert.strictEqual(isolated.byAgent.kirocrew.hooksPath, path.join(alternateHome, ".kiro", "crew", "hooks.json"));
+
+    const explicitEnvTarget = buildCleanupOptionsForHome(alternateHome, {
+      env: { KIROCREW_HOME: customHome },
+    });
+    assert.strictEqual(explicitEnvTarget.byAgent.kirocrew.hooksPath, path.join(customHome, "hooks.json"));
+
+    const explicitlyTargeted = buildCleanupOptionsForHome(alternateHome, {
+      env: { KIROCREW_HOME: customHome },
+      kirocrewHome: customHome,
+    });
+    assert.strictEqual(explicitlyTargeted.byAgent.kirocrew.hooksPath, path.join(customHome, "hooks.json"));
   });
 
   it("does not inherit the process DSH_HOME for an explicit alternate home", () => {
@@ -135,6 +172,7 @@ describe("cleanupIntegrations", () => {
       assert.strictEqual(fs.existsSync(stableDir), true);
 
       const result = await cleanupIntegrations({
+        dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND,
         homeDir,
         env: { CODEX_HOME: codexDir },
         backup: true,
@@ -170,6 +208,7 @@ describe("cleanupIntegrations", () => {
 
     try {
       const result = await cleanupIntegrations({
+        dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND,
         homeDir,
         platform: "win32",
         env: { REASONIX_HOME: "" },
@@ -209,6 +248,7 @@ describe("cleanupIntegrations", () => {
 
     try {
       const result = await cleanupIntegrations({
+        dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND,
         homeDir,
         platform: "win32",
         backup: true,
@@ -292,7 +332,7 @@ describe("cleanupIntegrations", () => {
     });
 
     try {
-      const result = await cleanupIntegrations({ homeDir, backup: true, silent: true, hermesCommand: false });
+      const result = await cleanupIntegrations({ dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND, homeDir, backup: true, silent: true, hermesCommand: false });
       assert.strictEqual(result.summary.failed, 1);
       assert.ok(result.summary.entriesRemoved >= 5);
 
@@ -332,7 +372,7 @@ describe("cleanupIntegrations", () => {
         opencode: listCleanupBackups(path.dirname(opencodePath)).length,
         kiro: listCleanupBackups(path.dirname(kiroTeamPath)).length,
       };
-      const second = await cleanupIntegrations({ homeDir, backup: true, silent: true, hermesCommand: false });
+      const second = await cleanupIntegrations({ dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND, homeDir, backup: true, silent: true, hermesCommand: false });
       assert.strictEqual(second.summary.failed, 1);
       assert.strictEqual(second.summary.entriesRemoved, 0);
       assert.deepStrictEqual({
@@ -360,6 +400,7 @@ describe("cleanupIntegrations", () => {
 
     try {
       const result = await cleanupIntegrations({
+        dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND,
         homeDir,
         backup: true,
         silent: true,
@@ -427,6 +468,7 @@ describe("cleanupIntegrations", () => {
   it("marks the claude-code agent failed when the precomputed cleanup result is an error", async () => {
     const homeDir = path.join(os.tmpdir(), "clawd-cleanup-claude-error-home");
     const result = await cleanupIntegrations({
+        dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND,
       homeDir,
       backup: true,
       silent: true,
@@ -764,7 +806,7 @@ describe("QwenWork integration cleanup (#843)", () => {
     const before = readJson(settingsPath);
 
     try {
-      const result = await cleanupIntegrations({ homeDir, backup: true, silent: true, hermesCommand: false });
+      const result = await cleanupIntegrations({ dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND, homeDir, backup: true, silent: true, hermesCommand: false });
       const qwenwork = result.agents.find((entry) => entry.agentId === "qwenwork");
 
       assert.ok(qwenwork, "qwenwork must be one of the agents cleanup iterates");
@@ -779,7 +821,7 @@ describe("QwenWork integration cleanup (#843)", () => {
       assertOnlyClawdHooksRemoved(settingsPath);
 
       const afterFirst = fs.readFileSync(settingsPath, "utf8");
-      const second = await cleanupIntegrations({ homeDir, backup: true, silent: true, hermesCommand: false });
+      const second = await cleanupIntegrations({ dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND, homeDir, backup: true, silent: true, hermesCommand: false });
       const qwenworkSecond = second.agents.find((entry) => entry.agentId === "qwenwork");
 
       assert.strictEqual(qwenworkSecond.status, "skipped");
@@ -872,11 +914,13 @@ describe("QwenWork integration cleanup (#843)", () => {
       };
 
       const result = await commandRegistry.cleanupIntegrations(null, {
+        dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND,
         snapshot,
         writeCodexAutoStartGate: () => true,
         // The real cleanup, scoped to the temp home — the whole point of the
         // finding is that the prefs half used to succeed on its own.
         cleanupIntegrations: (options) => cleanupIntegrations({
+        dshDesktopDiscovery: DESKTOP_DISCOVERY_NOT_FOUND,
           ...options,
           homeDir,
           silent: true,

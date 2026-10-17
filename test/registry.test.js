@@ -16,6 +16,7 @@ describe("Agent Registry", () => {
       "cursor-agent",
       "codebuddy",
       "kiro-cli",
+      "kirocrew",
       "kimi-cli",
       "qwen-code",
       "zcode",
@@ -39,7 +40,7 @@ describe("Agent Registry", () => {
 
   it("should look up agents by ID", () => {
     assert.strictEqual(registry.getAgent("claude-code").name, "Claude Code");
-    assert.strictEqual(registry.getAgent("deepseek-harness").name, "DeepSeek Harness (web, experimental)");
+    assert.strictEqual(registry.getAgent("deepseek-harness").name, "DeepSeek Harness (experimental)");
     assert.strictEqual(registry.getAgent("codex").name, "Codex CLI");
     assert.strictEqual(registry.getAgent("copilot-cli").name, "Copilot CLI");
     assert.strictEqual(registry.getAgent("gemini-cli").name, "Gemini CLI");
@@ -306,7 +307,7 @@ describe("Agent Registry", () => {
     const codex = registry.getAgent("codex");
     assert.strictEqual(codex.capabilities.httpHook, false);
     assert.strictEqual(codex.capabilities.permissionApproval, true);
-    assert.strictEqual(codex.capabilities.sessionEnd, false);
+    assert.strictEqual(codex.capabilities.sessionEnd, true);
     assert.strictEqual(codex.capabilities.subagent, false);
 
     const zcode = registry.getAgent("zcode");
@@ -447,6 +448,25 @@ describe("Agent Registry", () => {
     assert.strictEqual(traecode.capabilities.notificationHook, true);
     assert.strictEqual(traecode.capabilities.sessionEnd, false);
     assert.strictEqual(traecode.capabilities.subagent, false);
+  });
+
+  it("declares the mobile permission observation capability for every agent", () => {
+    const enabled = [];
+    for (const agent of registry.getAllAgents()) {
+      assert.strictEqual(
+        typeof agent.capabilities.mobilePermissionObservation,
+        "boolean",
+        `${agent.id} must explicitly declare mobilePermissionObservation`
+      );
+      if (agent.capabilities.mobilePermissionObservation) enabled.push(agent.id);
+    }
+    assert.deepStrictEqual(enabled.sort(), [
+      "claude-code",
+      "codebuddy",
+      "codex",
+      "hermes",
+      "qwen-code",
+    ]);
   });
 
   it("should have eventMap for hook-based agents", () => {

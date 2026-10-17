@@ -13,7 +13,8 @@ const _calicoTheme = themeLoader.loadTheme("calico");
 const _cloudlingTheme = themeLoader.loadTheme("cloudling");
 const { createTranslator } = require("../src/i18n");
 const { makeSessionKey, resolveSessionIdentity } = require("../src/session-key");
-const { isSessionInProgress } = require("../src/state-session-snapshot");
+const { isSessionInProgress, sessionSnapshotSignature } = require("../src/state-session-snapshot");
+const { isFocusableLocalHudSession } = require("../src/session-focus");
 const { countLiveSubagents } = require("../src/state-visual-resolver");
 const { resolveIdleVisualChoice } = require("../src/idle-visual");
 
@@ -68,6 +69,111 @@ function makePidKill(alivePids) {
 function cloneTheme(theme) {
   return JSON.parse(JSON.stringify(theme));
 }
+
+describe("Claude correlated batch phase", () => {
+  let api;
+  let ctx;
+  beforeEach(() => { ctx = makeCtx(); api = require("../src/state")(ctx); });
+  afterEach(() => api.cleanup());
+  const sid = "batch-session";
+  function event(name, state, extra = {}) {
+    return api.updateSession(sid, state, name, { agentId: "claude-code", claudePromptId: "prompt-1", ...extra });
+  }
+
+  it("waits for a whole parallel batch then ignores its late per-tool callbacks", () => {
+    event("UserPromptSubmit", "thinking");
+    event("PreToolUse", "working", { toolUseId: "tool-a" });
+    event("PreToolUse", "working", { toolUseId: "tool-b" });
+    event("PostToolUse", "working", { toolUseId: "tool-a" });
+    assert.equal(event("PostToolBatch", "thinking", { batchToolUseIds: ["tool-a"] }), false);
+    assert.equal(api.sessions.get(sid).state, "working");
+    event("PostToolBatch", "thinking", { batchToolUseIds: ["tool-a", "tool-b"] });
+    assert.equal(api.sessions.get(sid).state, "thinking");
+    const before = JSON.stringify(api.buildSessionSnapshot());
+    assert.equal(event("PostToolUse", "working", { toolUseId: "tool-b" }), false);
+    assert.equal(event("PostToolBatch", "thinking", { batchToolUseIds: ["tool-a", "tool-b"] }), false);
+    assert.equal(JSON.stringify(api.buildSessionSnapshot()), before);
+  });
+
+  it("rejects old-prompt batches, tool tails and Stop without disturbing a newer tool", () => {
+    event("UserPromptSubmit", "thinking");
+    event("PreToolUse", "working", { toolUseId: "old-tool" });
+    event("UserPromptSubmit", "thinking", { claudePromptId: "prompt-2" });
+    event("PreToolUse", "working", { claudePromptId: "prompt-2", toolUseId: "new-tool" });
+    const before = JSON.stringify(api.buildSessionSnapshot());
+    assert.equal(event("PostToolBatch", "thinking", { batchToolUseIds: ["old-tool"] }), false);
+    assert.equal(event("PostToolUse", "working", { toolUseId: "old-tool" }), false);
+    assert.equal(event("Stop", "attention"), false);
+    assert.equal(JSON.stringify(api.buildSessionSnapshot()), before);
+  });
+
+  it("does not resurrect a completed turn or create an unobserved session", () => {
+    assert.equal(event("PostToolBatch", "thinking", { batchToolUseIds: ["tool-a"] }), false);
+    assert.equal(api.sessions.size, 0);
+    event("UserPromptSubmit", "thinking");
+    event("PreToolUse", "working", { toolUseId: "tool-a" });
+    event("Stop", "attention");
+    const before = JSON.stringify(api.buildSessionSnapshot());
+    assert.equal(event("PostToolBatch", "thinking", { batchToolUseIds: ["tool-a"] }), false);
+    assert.equal(JSON.stringify(api.buildSessionSnapshot()), before);
+  });
+
+  it("keeps pending approvals and confirmed subagents visible", () => {
+    event("UserPromptSubmit", "thinking");
+    event("PreToolUse", "working", { toolUseId: "tool-a" });
+    ctx.pendingPermissions.push({ sessionId: sid, agentId: "claude-code", res: {} });
+    assert.equal(event("PostToolBatch", "thinking", { batchToolUseIds: ["tool-a"] }), false);
+    ctx.pendingPermissions.length = 0;
+    event("SubagentStart", "juggling", { subagentId: "child-a", subagentLifecycleSource: "native" });
+    event("PostToolBatch", "thinking", { batchToolUseIds: ["tool-a"] });
+    assert.equal(api.sessions.get(sid).state, "juggling");
+    assert.equal(api.sessions.get(sid).subagentTracker.confirmedIds.size, 1);
+  });
+
+  it("keeps a delayed synthetic subagent start above its early batch hint", () => {
+    event("UserPromptSubmit", "thinking");
+    event("PostToolBatch", "thinking", { batchToolUseIds: ["agent-tool"] });
+    event("SubagentStart", "juggling", { toolUseId: "agent-tool", toolName: "Agent",
+      subagentLifecycleSource: "synthetic-tool" });
+    assert.equal(api.sessions.get(sid).subagentTracker.legacyFloor, true);
+    assert.equal(api.sessions.get(sid).state, "juggling");
+  });
+
+  it("keeps legacy working when prompt identity is absent and never treats a batch as completion", () => {
+    const sounds = [];
+    ctx.playSound = (...args) => sounds.push(args);
+    event("UserPromptSubmit", "thinking", { claudePromptId: null });
+    event("PreToolUse", "working", { claudePromptId: null, toolUseId: "tool-a" });
+    assert.equal(event("PostToolBatch", "thinking", { batchToolUseIds: ["tool-a"] }), false);
+    assert.equal(api.sessions.get(sid).state, "working");
+    event("UserPromptSubmit", "thinking", { claudePromptId: "prompt-2" });
+    event("PreToolUse", "working", { claudePromptId: "prompt-2", toolUseId: "tool-b" });
+    event("PostToolUseFailure", "error", { claudePromptId: "prompt-2", toolUseId: "tool-b" });
+    event("PostToolBatch", "thinking", { claudePromptId: "prompt-2", batchToolUseIds: ["tool-b"] });
+    assert.equal(api.sessions.get(sid).state, "thinking");
+    assert.notEqual(api.sessions.get(sid).requiresCompletionAck, true, "a batch does not create a completed-turn acknowledgement");
+    assert.ok(!sounds.some((args) => args.includes("happy")));
+  });
+
+  for (const batchFirst of [true, false]) {
+    it(`plays the failure cue and resumes thinking with real theme holds when batchFirst=${batchFirst}`, (t) => {
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+      try {
+        event("UserPromptSubmit", "thinking");
+        event("PreToolUse", "working", { toolUseId: "failed-tool" });
+        if (batchFirst) event("PostToolBatch", "thinking", { batchToolUseIds: ["failed-tool"] });
+        event("PostToolUseFailure", "error", { toolUseId: "failed-tool" });
+        if (!batchFirst) event("PostToolBatch", "thinking", { batchToolUseIds: ["failed-tool"] });
+        t.mock.timers.tick(1000);
+        assert.equal(api.getCurrentState(), "error");
+        assert.equal(api.sessions.get(sid).state, "thinking");
+        t.mock.timers.tick(5000);
+        assert.equal(api.getCurrentState(), "thinking");
+        assert.equal(api.sessions.get(sid).requiresCompletionAck, undefined);
+      } finally { api.cleanup(); t.mock.timers.reset(); }
+    });
+  }
+});
 
 describe("optional mini peek states", () => {
   let api;
@@ -135,6 +241,8 @@ function update(api, o = {}) {
       editor: o.editor || null,
       pidChain: o.pidChain || null,
       orcaPaneKey: o.orcaPaneKey ?? null,
+      herdrPaneId: o.herdrPaneId ?? null,
+      herdrSocket: o.herdrSocket ?? null,
       agentPid: o.agentPid ?? null,
       agentId: o.agentId || "claude-code",
       profileId: o.profileId,
@@ -143,6 +251,7 @@ function update(api, o = {}) {
       headless: o.headless || false,
       displayHint: o.displayHint,
       sessionTitle: o.sessionTitle ?? null,
+      sessionTitleFromPrompt: o.sessionTitleFromPrompt === true,
       contextUsage: o.contextUsage ?? null,
       contextUsageOrigin: o.contextUsageOrigin ?? null,
       antigravityQuota: o.antigravityQuota ?? null,
@@ -152,6 +261,7 @@ function update(api, o = {}) {
       provider: o.provider ?? null,
       codexOriginator: o.codexOriginator ?? null,
       codexSource: o.codexSource ?? null,
+      dshCarrier: o.dshCarrier ?? null,
       ghosttyTerminalId: o.ghosttyTerminalId ?? null,
       assistantLastOutput: o.assistantLastOutput ?? null,
       assistantLastOutputTruncated: o.assistantLastOutputTruncated ?? false,
@@ -643,6 +753,27 @@ describe("setState() debounce", () => {
     assert.strictEqual(api.getCurrentState(), "working"); // still waiting
     mock.timers.tick(1000);
     assert.strictEqual(api.getCurrentState(), "error");
+  });
+
+  it("a same-state restart renews the hold and cancels a queued idle", () => {
+    api.setState("sweeping");
+    mock.timers.tick(1000);
+    api.setState("idle");
+    api.setState("sweeping", undefined, { restartAnimation: true });
+    api.setState("idle");
+    mock.timers.tick(_defaultTheme.timings.minDisplay.sweeping - 1);
+    assert.strictEqual(api.getCurrentState(), "sweeping");
+    mock.timers.tick(1);
+    assert.strictEqual(api.getCurrentState(), "idle");
+  });
+
+  it("a same-state restart preserves a queued higher-priority alert", () => {
+    api.setState("sweeping");
+    api.setState("notification");
+    mock.timers.tick(1000);
+    api.setState("sweeping", undefined, { restartAnimation: true });
+    mock.timers.tick(_defaultTheme.timings.minDisplay.sweeping - 1000);
+    assert.strictEqual(api.getCurrentState(), "notification");
   });
 
   it("lower priority cannot override pending", () => {
@@ -2018,6 +2149,71 @@ describe("updateSession()", () => {
     assert.ok(!api.sessions.has("s1"));
   });
 
+  it("issue #1073 follow-up: deletes a local Codex session on SessionEnd without a completion cue", () => {
+    api.cleanup();
+    const sounds = [];
+    api = require("../src/state")(makeCtx({
+      processKill: () => true,
+      playSound: (name) => sounds.push(name),
+    }));
+
+    update(api, {
+      id: "codex-end",
+      state: "working",
+      event: "PreToolUse",
+      agentId: "codex",
+      profileId: "local",
+      rawSessionId: "codex:019d23d4-f1a9-7633-b9c7-758327137228",
+    });
+    update(api, {
+      id: "codex-end",
+      state: "sleeping",
+      event: "SessionEnd",
+      agentId: "codex",
+      profileId: "local",
+      rawSessionId: "codex:019d23d4-f1a9-7633-b9c7-758327137228",
+    });
+
+    assert.ok(!api.sessions.has("codex-end"));
+    assert.deepStrictEqual(sounds.filter((name) => name === "complete"), []);
+  });
+
+  it("issue #1073 follow-up: keeps a local Codex session when a replyable completion mapping exists", () => {
+    api.cleanup();
+    const sounds = [];
+    const lifecycle = [];
+    api = require("../src/state")(makeCtx({
+      processKill: () => true,
+      playSound: (name) => sounds.push(name),
+      onSessionAutomationLifecycleEnd: (payload) => lifecycle.push(payload),
+      hasReplyableCompletionMapping: (sessionId, session) =>
+        sessionId === "codex-reply" && !!session && session.agentId === "codex",
+    }));
+
+    update(api, {
+      id: "codex-reply",
+      state: "idle",
+      event: "Stop",
+      agentId: "codex",
+      profileId: "local",
+      rawSessionId: "codex:019d23d4-f1a9-7633-b9c7-758327137228",
+    });
+    const stateBefore = api.sessions.get("codex-reply").state;
+    update(api, {
+      id: "codex-reply",
+      state: "sleeping",
+      event: "SessionEnd",
+      agentId: "codex",
+      profileId: "local",
+      rawSessionId: "codex:019d23d4-f1a9-7633-b9c7-758327137228",
+    });
+
+    assert.ok(api.sessions.has("codex-reply"), "replyable session must survive SessionEnd");
+    assert.strictEqual(api.sessions.get("codex-reply").state, stateBefore);
+    assert.deepStrictEqual(lifecycle, []);
+    assert.deepStrictEqual(sounds.filter((name) => name === "complete"), []);
+  });
+
   it("clears session automation before a main SessionEnd but not a subagent lifecycle event", () => {
     api.cleanup();
     const lifecycle = [];
@@ -2374,6 +2570,33 @@ describe("updateSession()", () => {
     // !== would read 100 and "100" as two different terminals.
     update(api, { id: "s1", state: "working", event: "agentMessage", sourcePid: "100" });
     assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-1:leaf-1");
+  });
+
+  it("keeps the herdr pane sticky, with its socket, until the session moves (#1139)", () => {
+    update(api, {
+      id: "s1",
+      state: "thinking",
+      event: "UserPromptSubmit",
+      sourcePid: 900,
+      herdrPaneId: "w5:p4",
+      herdrSocket: "/tmp/herdr.sock",
+    });
+    update(api, { id: "s1", state: "working", event: "PreToolUse" });
+    assert.strictEqual(api.sessions.get("s1").herdrPaneId, "w5:p4");
+    assert.strictEqual(api.sessions.get("s1").herdrSocket, "/tmp/herdr.sock");
+
+    // A new pane id replaces the socket too, rather than keeping the old one.
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: 900, herdrPaneId: "w5:p7" });
+    assert.strictEqual(api.sessions.get("s1").herdrPaneId, "w5:p7");
+    assert.strictEqual(api.sessions.get("s1").herdrSocket, null);
+
+    // Resumed outside herdr: the SessionStart carries no pane, so it is dropped.
+    update(api, { id: "s1", state: "idle", event: "SessionStart", sourcePid: 901 });
+    assert.strictEqual(api.sessions.get("s1").herdrPaneId, null);
+
+    update(api, { id: "s1", state: "thinking", event: "UserPromptSubmit", sourcePid: 900, herdrPaneId: "w1:p1" });
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: 777 });
+    assert.strictEqual(api.sessions.get("s1").herdrPaneId, null, "a terminal change drops the pane");
   });
 
   it("keeps Ghostty terminal id sticky and allows focus-only metadata updates", () => {
@@ -3243,6 +3466,188 @@ describe("updateSession()", () => {
     assert.strictEqual(api.sessions.get("s2").sessionTitle, "新标题");
   });
 
+  // ── prompt-fallback session titles (#1125) ──
+
+  it("keeps a formal title when a later prompt fallback arrives (#1125)", () => {
+    update(api, { id: "s1", state: "thinking", sessionTitle: "Formal Title" });
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "Prompt line", sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Formal Title");
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, false);
+  });
+
+  it("shows the latest prompt fallback when only prompt titles exist (#1125)", () => {
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "First prompt", sessionTitleFromPrompt: true,
+    });
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "Second prompt", sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Second prompt");
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, true);
+  });
+
+  it("replaces a prompt fallback with a later formal title (#1125)", () => {
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "Prompt line", sessionTitleFromPrompt: true,
+    });
+    update(api, { id: "s1", state: "thinking", sessionTitle: "Formal Title" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Formal Title");
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, false);
+  });
+
+  it("lets the latest formal title win (#1125)", () => {
+    update(api, { id: "s1", state: "thinking", sessionTitle: "Old Formal" });
+    update(api, { id: "s1", state: "thinking", sessionTitle: "New Formal" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "New Formal");
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, false);
+  });
+
+  it("treats a metadata title as formal against a later prompt fallback (#1125)", () => {
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "Prompt line", sessionTitleFromPrompt: true,
+    });
+    api.updateSessionMetadata("s1", { sessionTitle: "Metadata Title" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Metadata Title");
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, false);
+
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "Later prompt", sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Metadata Title");
+  });
+
+  it("keeps a restored title against a later prompt fallback (#1125)", () => {
+    const restored = api.restoreSessionFromLease({
+      agentId: "claude-code",
+      sessionId: "restored-session",
+      active: true,
+      state: "thinking",
+      eventAt: 1000,
+      validUntil: null,
+      pid: process.pid,
+      sourcePid: process.pid,
+      cwd: "/tmp/project",
+      title: "Restored Title",
+    });
+    assert.strictEqual(restored, true);
+
+    const sessionId = makeSessionKey({ profileId: "local", rawSessionId: "restored-session" });
+    update(api, {
+      id: sessionId,
+      state: "thinking",
+      event: "UserPromptSubmit",
+      sessionTitle: "Prompt line",
+      sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get(sessionId).sessionTitle, "Restored Title");
+  });
+
+  it("keeps the first prompt title for traecode even when marked as prompt-derived (#1125)", () => {
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit", agentId: "traecode",
+      sessionTitle: "第一个问题", sessionTitleFromPrompt: true,
+    });
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit", agentId: "traecode",
+      sessionTitle: "第二个问题", sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "第一个问题");
+  });
+
+  it("resets the prompt-derived flag when metadata writes a title (#1125)", () => {
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "Prompt line", sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, true);
+    api.updateSessionMetadata("s1", { sessionTitle: "Metadata Title" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, false);
+  });
+
+  it("treats an identical metadata title as formal against a later prompt fallback (#1125)", () => {
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "Same", sessionTitleFromPrompt: true,
+    });
+    api.updateSessionMetadata("s1", { sessionTitle: "Same" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, false);
+
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "Other", sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "Same");
+  });
+
+  it("keeps the prompt origin across untitled events so a later prompt replaces it (#1125)", () => {
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "A", sessionTitleFromPrompt: true,
+    });
+    for (const [state, event] of [
+      ["working", "PreToolUse"],
+      ["working", "PostToolUse"],
+      ["idle", "Stop"],
+    ]) {
+      update(api, { id: "s1", state, event });
+      assert.strictEqual(api.sessions.get("s1").sessionTitle, "A", event);
+      assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, true, event);
+    }
+
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "B", sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "B");
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, true);
+  });
+
+  it("keeps the prompt origin across a Codex permission rebuild (#1125)", () => {
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit", agentId: "codex",
+      sessionTitle: "A", sessionTitleFromPrompt: true,
+    });
+    update(api, {
+      id: "s1", state: "notification", event: "PermissionRequest", agentId: "codex",
+      transientPermissionEvent: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "A");
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, true);
+
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit", agentId: "codex",
+      sessionTitle: "B", sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "B");
+  });
+
+  it("keeps the prompt origin across subagent start and stop rebuilds (#1125)", () => {
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "A", sessionTitleFromPrompt: true,
+    });
+    update(api, { id: "s1", state: "working", event: "PreToolUse" });
+    update(api, { id: "s1", state: "juggling", event: "SubagentStart" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, true);
+    update(api, { id: "s1", state: "working", event: "SubagentStop" });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "A");
+    assert.strictEqual(api.sessions.get("s1").sessionTitleFromPrompt, true);
+
+    update(api, {
+      id: "s1", state: "thinking", event: "UserPromptSubmit",
+      sessionTitle: "B", sessionTitleFromPrompt: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, "B");
+  });
+
   it("stores optional platform and model metadata", () => {
     update(api, {
       id: "s1",
@@ -3365,6 +3770,39 @@ describe("updateSession()", () => {
       percent: 19,
       source: "codex",
     });
+  });
+
+  // issue #655: WorkBuddy 5.6.x delivers UserPromptSubmit ~0.1s before
+  // SessionStart on every turn, so the hook marks SessionStart preserve_state.
+  // Without it the late idle SessionStart would flip the running turn to idle.
+  it("issue #655: keeps a running WorkBuddy turn thinking across a late preserveState SessionStart", () => {
+    api.updateSession("workbuddy:turn", "thinking", "UserPromptSubmit", {
+      agentId: "workbuddy",
+      cwd: "/tmp/repo",
+    });
+    api.updateSession("workbuddy:turn", "idle", "SessionStart", {
+      agentId: "workbuddy",
+      cwd: "/tmp/repo",
+      preserveState: true,
+    });
+
+    assert.strictEqual(
+      api.sessions.get("workbuddy:turn").state,
+      "thinking",
+      "the late SessionStart must not flip a running turn back to idle",
+    );
+  });
+
+  it("issue #655: still creates an idle WorkBuddy session from a preserveState SessionStart when none exists", () => {
+    api.updateSession("workbuddy:cold", "idle", "SessionStart", {
+      agentId: "workbuddy",
+      cwd: "/tmp/repo",
+      preserveState: true,
+    });
+
+    const session = api.sessions.get("workbuddy:cold");
+    assert.ok(session, "SessionStart must still create the session");
+    assert.strictEqual(session.state, "idle");
   });
 
   // Account quota is not session state: it lives in the session-independent
@@ -5712,6 +6150,77 @@ describe("Stop completion gate (#406)", () => {
     }
   });
 
+  for (const batchFirst of [true, false]) {
+    it(`keeps the AskUserQuestion transcript fallback after a batch (batchFirst=${batchFirst})`, () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-claude-batch-probe-"));
+      const transcript = path.join(dir, "transcript.jsonl");
+      const rawSessionId = "claude-batch-probe";
+      const sessionId = resolveSessionIdentity(rawSessionId, "local").sessionId;
+      const opts = { agentId: "claude-code", rawSessionId, claudePromptId: "probe-prompt",
+        toolUseId: "ask-tool", toolName: "AskUserQuestion", transcriptPath: transcript };
+      const batch = () => api.updateSession(sessionId, "thinking", "PostToolBatch",
+        { ...opts, batchToolUseIds: ["ask-tool"] });
+      try {
+        fs.writeFileSync(transcript, JSON.stringify({ type: "assistant",
+          message: { content: [{ type: "tool_use", name: "AskUserQuestion" }] } }) + "\n");
+        api.updateSession(sessionId, "thinking", "UserPromptSubmit", opts);
+        api.updateSession(sessionId, "working", "PreToolUse", opts);
+        if (batchFirst) batch();
+        api.updateSession(sessionId, "working", "PostToolUse", opts);
+        if (!batchFirst) batch();
+        mock.timers.tick(1999);
+        assert.equal(api.sessions.get(sessionId).state, "thinking");
+        assert.ok(!soundsPlayed.includes("complete"));
+        fs.appendFileSync(transcript, JSON.stringify({ type: "assistant",
+          message: { content: "Final answer after the question." } }) + "\n");
+        mock.timers.tick(1);
+        assert.equal(api.sessions.get(sessionId).state, "idle");
+        assert.equal(api.deriveSessionBadge(api.sessions.get(sessionId)), "done");
+        mock.timers.tick(_defaultTheme.timings.minDisplay.thinking);
+        assert.equal(soundsPlayed.filter(sound => sound === "complete").length, 1);
+        assert.equal(batch(), false, "a trailing batch cannot reopen transcript completion");
+        api.updateSession(sessionId, "working", "PreToolUse",
+          { ...opts, claudePromptId: "queued-prompt", toolUseId: "queued-tool", toolName: "Read" });
+        api.updateSession(sessionId, "thinking", "PostToolBatch",
+          { ...opts, claudePromptId: "queued-prompt", batchToolUseIds: ["queued-tool"] });
+        assert.equal(api.sessions.get(sessionId).state, "thinking");
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
+  it("cancels the batch-thinking question probe when a real next tool starts", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-claude-batch-probe-"));
+    const transcript = path.join(dir, "transcript.jsonl");
+    const opts = { agentId: "claude-code", claudePromptId: "probe-prompt", toolUseId: "ask-tool",
+      toolName: "AskUserQuestion", transcriptPath: transcript };
+    try {
+      fs.writeFileSync(transcript, "");
+      api.updateSession("probe-cancel", "thinking", "UserPromptSubmit", opts);
+      api.updateSession("probe-cancel", "working", "PreToolUse", opts);
+      api.updateSession("probe-cancel", "working", "PostToolUse", opts);
+      api.updateSession("probe-cancel", "thinking", "PostToolBatch", { ...opts, batchToolUseIds: ["ask-tool"] });
+      api.updateSession("probe-cancel", "working", "PreToolUse", { ...opts, toolUseId: "next-tool", toolName: "Read" });
+      api.updateSession("probe-cancel", "working", "PostToolUse", opts);
+      fs.appendFileSync(transcript, JSON.stringify({ type: "assistant", message: { content: "Old final answer." } }) + "\n");
+      mock.timers.tick(10000);
+      assert.equal(api.sessions.get("probe-cancel").state, "working");
+      assert.ok(!soundsPlayed.includes("complete"));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("keeps newer work active when an older early batch's tool arrives late", () => {
+    const sid = "interleaved-batch-session";
+    const event = (name, value, extra = {}) => api.updateSession(sid, value, name,
+      { agentId: "claude-code", claudePromptId: "same-prompt", ...extra });
+    event("UserPromptSubmit", "thinking");
+    event("PostToolBatch", "thinking", { batchToolUseIds: ["old-tool"] });
+    event("PreToolUse", "working", { toolUseId: "new-tool" });
+    event("PreToolUse", "working", { toolUseId: "old-tool" });
+    assert.equal(api.sessions.get(sid).state, "working");
+    event("PostToolBatch", "thinking", { batchToolUseIds: ["new-tool"] });
+    assert.equal(api.sessions.get(sid).state, "thinking");
+  });
+
   it("Claude AskUserQuestion PostToolUse falls back to transcript completion when Stop is missed", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-claude-stop-fallback-"));
     const transcript = path.join(dir, "transcript.jsonl");
@@ -6913,3 +7422,218 @@ describe("antigravity trailing PostToolUse filter", () => {
 });
 
 // ── trellis parallel-task juggling (avatar R3.1) ──
+// ═════════════════════════════════════════════════════════════════════════════
+// Desktop apps can reopen a previous conversation on launch, so their
+// SessionStart only means "opened", not "used". Clawd keeps that row out of the
+// HUD until the user does something, while the Dashboard keeps listing and
+// opening it. DSH and Kimi Code both behave this way.
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("reopened conversation stays out of the HUD until activity", () => {
+  const CASES = [
+    {
+      label: "DSH",
+      agentId: "deepseek-harness",
+      sessionId: "deepseek-harness:conversation",
+      ghostId: "deepseek-harness:ghost",
+      extra: { dshCarrier: "desktop" },
+      focusTarget: { type: "dsh-desktop", url: "dsh://open" },
+    },
+    {
+      label: "Kimi Code",
+      agentId: "kimi-cli",
+      sessionId: "kimi-cli:conversation",
+      ghostId: "kimi-cli:ghost",
+      extra: { sourcePid: 4242 },
+      focusTarget: { type: "terminal", url: null },
+    },
+  ];
+
+  for (const testCase of CASES) {
+    describe(`${testCase.label}`, () => {
+      let api;
+
+      beforeEach(() => {
+        mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+        api = require("../src/state")(makeCtx());
+      });
+      afterEach(() => {
+        api.cleanup();
+        mock.timers.reset();
+      });
+
+      function sessionStart(overrides = {}) {
+        update(api, {
+          id: testCase.sessionId,
+          state: "idle",
+          event: "SessionStart",
+          agentId: testCase.agentId,
+          rawSessionId: "conversation",
+          ...testCase.extra,
+          ...overrides,
+        });
+      }
+
+      function snapshotEntry(snapshot) {
+        return snapshot.sessions.find((entry) => entry.id === testCase.sessionId);
+      }
+
+      it("hides a reopened conversation from the HUD but keeps it openable from the Dashboard", () => {
+        sessionStart();
+
+        assert.strictEqual(api.sessions.get(testCase.sessionId).awaitingActivity, true);
+
+        const snapshot = api.buildSessionSnapshot();
+        const entry = snapshotEntry(snapshot);
+        assert.ok(entry, "the Dashboard snapshot still lists the reopened conversation");
+        assert.strictEqual(entry.hiddenFromHud, true);
+        assert.strictEqual(snapshot.hudTotalNonIdle, 0);
+        assert.strictEqual(snapshot.hudLastSessionId, null);
+        assert.strictEqual(isFocusableLocalHudSession(entry, { osPlatform: "darwin" }), false);
+        // The marker only hides the HUD; the Dashboard "open" button stays usable.
+        assert.strictEqual(entry.canFocus, true);
+        assert.deepStrictEqual(entry.focusTarget, testCase.focusTarget);
+      });
+
+      it("reveals the conversation once the user prompts, and moves the snapshot signature", () => {
+        sessionStart();
+        const hiddenSignature = sessionSnapshotSignature(api.buildSessionSnapshot());
+
+        update(api, {
+          id: testCase.sessionId,
+          state: "thinking",
+          event: "UserPromptSubmit",
+          agentId: testCase.agentId,
+          ...testCase.extra,
+        });
+
+        const session = api.sessions.get(testCase.sessionId);
+        assert.strictEqual(session.awaitingActivity, false);
+        const snapshot = api.buildSessionSnapshot();
+        const entry = snapshotEntry(snapshot);
+        assert.strictEqual(entry.hiddenFromHud, false);
+        assert.strictEqual(snapshot.hudTotalNonIdle, 1);
+        assert.strictEqual(isFocusableLocalHudSession(entry, { osPlatform: "darwin" }), true);
+        assert.notStrictEqual(sessionSnapshotSignature(snapshot), hiddenSignature);
+      });
+
+      it("treats a permission approval as activity and never creates a session from it", () => {
+        sessionStart();
+        assert.strictEqual(api.sessions.get(testCase.sessionId).awaitingActivity, true);
+
+        api.updateSession(testCase.sessionId, "notification", "PermissionRequest", {
+          agentId: testCase.agentId,
+          ...testCase.extra,
+        });
+        assert.strictEqual(api.sessions.size, 1);
+        assert.strictEqual(api.sessions.get(testCase.sessionId).awaitingActivity, false);
+        assert.strictEqual(snapshotEntry(api.buildSessionSnapshot()).hiddenFromHud, false);
+
+        api.updateSession(testCase.ghostId, "notification", "PermissionRequest", {
+          agentId: testCase.agentId,
+        });
+        assert.strictEqual(api.sessions.has(testCase.ghostId), false);
+      });
+
+      it("broadcasts the approval snapshot itself, not only the trailing ack pass", () => {
+        const broadcasts = [];
+        const ctx = makeCtx({ broadcastSessionSnapshot: (snapshot) => broadcasts.push(snapshot) });
+        const localApi = require("../src/state")(ctx);
+        try {
+          update(localApi, {
+            id: testCase.sessionId,
+            state: "idle",
+            event: "SessionStart",
+            agentId: testCase.agentId,
+            rawSessionId: "conversation",
+            ...testCase.extra,
+          });
+          // Pre-seed a completion ack so the approval's own emit is observable: the
+          // trailing try/finally pass reconciles the ack afterwards and would
+          // otherwise dedupe away the approval emit.
+          localApi.sessions.get(testCase.sessionId).requiresCompletionAck = true;
+          broadcasts.length = 0;
+
+          localApi.updateSession(testCase.sessionId, "notification", "PermissionRequest", {
+            agentId: testCase.agentId,
+            ...testCase.extra,
+          });
+
+          assert.strictEqual(localApi.sessions.get(testCase.sessionId).awaitingActivity, false);
+          assert.strictEqual(broadcasts.length, 2, "the approval path emits before the finally pass");
+          const approval = broadcasts[0].sessions.find((s) => s.id === testCase.sessionId);
+          assert.ok(approval, "the approval snapshot still lists the conversation");
+          assert.strictEqual(approval.hiddenFromHud, false);
+          assert.strictEqual(approval.requiresCompletionAck, true, "the first emit is the approval path, before ack reconciliation");
+          assert.strictEqual(
+            broadcasts[1].sessions.find((s) => s.id === testCase.sessionId).hiddenFromHud,
+            false
+          );
+        } finally {
+          localApi.cleanup();
+        }
+      });
+
+      it("leaves the marker alone for metadata-only title updates", () => {
+        sessionStart();
+
+        assert.strictEqual(api.updateSessionMetadata(testCase.sessionId, { sessionTitle: "Greeting" }), true);
+
+        const session = api.sessions.get(testCase.sessionId);
+        assert.strictEqual(session.awaitingActivity, true);
+        assert.strictEqual(session.sessionTitle, "Greeting");
+        const entry = snapshotEntry(api.buildSessionSnapshot());
+        assert.strictEqual(entry.hiddenFromHud, true);
+        assert.strictEqual(entry.displayTitle, "Greeting");
+      });
+
+      it("re-marks an already-active conversation when it is reopened", () => {
+        update(api, {
+          id: testCase.sessionId,
+          state: "thinking",
+          event: "UserPromptSubmit",
+          agentId: testCase.agentId,
+          ...testCase.extra,
+        });
+        assert.strictEqual(api.sessions.get(testCase.sessionId).awaitingActivity, false);
+
+        sessionStart();
+
+        assert.strictEqual(api.sessions.get(testCase.sessionId).awaitingActivity, true);
+        assert.strictEqual(snapshotEntry(api.buildSessionSnapshot()).hiddenFromHud, true);
+      });
+    });
+  }
+
+  it("leaves unlisted agents' SessionStart untouched", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    const api = require("../src/state")(makeCtx());
+    try {
+      update(api, {
+        id: "claude-1",
+        state: "idle",
+        event: "SessionStart",
+        agentId: "claude-code",
+        sourcePid: 4242,
+      });
+      update(api, {
+        id: "codex-1",
+        state: "idle",
+        event: "SessionStart",
+        agentId: "codex",
+        sourcePid: 4243,
+      });
+
+      for (const id of ["claude-1", "codex-1"]) {
+        assert.strictEqual(api.sessions.get(id).awaitingActivity, undefined);
+      }
+      const snapshot = api.buildSessionSnapshot();
+      assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "claude-1").hiddenFromHud, false);
+      assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "codex-1").hiddenFromHud, false);
+      assert.strictEqual(snapshot.hudTotalNonIdle, 2);
+    } finally {
+      api.cleanup();
+      mock.timers.reset();
+    }
+  });
+});

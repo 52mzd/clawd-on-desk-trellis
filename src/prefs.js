@@ -51,6 +51,7 @@ const {
   MAX_AUTO_CLOSE_SECONDS,
 } = require("./bubble-policy");
 const { normalizeSessionAliases } = require("./session-alias");
+const { normalizeQuotaAlertThresholds } = require("./quota-alerts");
 const {
   TEXT_SCALE_MIN,
   TEXT_SCALE_MAX,
@@ -63,7 +64,7 @@ const {
   PET_MOUTH_ACCESSORY_IDS,
 } = require("./pet-customization-catalog");
 
-const CURRENT_VERSION = 20;
+const CURRENT_VERSION = 21;
 const DEFAULT_INTEGRATION_INSTALLED_IDS = Object.freeze(["claude-code", "codex"]);
 const DEFAULT_INTEGRATION_INSTALLED_SET = new Set(DEFAULT_INTEGRATION_INSTALLED_IDS);
 
@@ -195,6 +196,9 @@ const SCHEMA = {
   // Preserve the historical used-percentage presentation for existing users;
   // remaining is a display-only choice and never changes stored quota data.
   quotaRingDisplayMode: { type: "string", default: "used", enum: ["used", "remaining"] },
+  quotaAlertsEnabled: { type: "boolean", default: false },
+  quotaAlertThresholds: { type: "array", defaultFactory: () => [20, 10], normalize: normalizeQuotaAlertThresholds },
+  quotaRecoveryAlertsEnabled: { type: "boolean", default: true },
   // Empty by default, i.e. every connected provider draws — matching the
   // behaviour before this preference existed. Storing what is HIDDEN rather
   // than what is shown is the reason a newly connected provider appears on its
@@ -309,6 +313,9 @@ const SCHEMA = {
   testReactionsEnabled: { type: "boolean", default: false },
   lowPowerIdleMode: { type: "boolean", default: false },
   mobilePreviewEnabled: { type: "boolean", default: false },
+  // Separate, explicit consent for the broader permission-summary disclosure.
+  // Never infer this from the legacy session-only mobile preview opt-in.
+  mobilePermissionPreviewEnabled: { type: "boolean", default: false },
   // When true, prevent the OS from sleeping while any agent task is in
   // progress (working/thinking/etc.); allow sleep again once tasks finish.
   keepAwakeWhileWorking: { type: "boolean", default: false },
@@ -407,7 +414,7 @@ const SCHEMA = {
       // normalizeAgents drops it for agents whose default entry lacks it.
       "claude-code": { integrationInstalled: true, enabled: true, permissionsEnabled: true, subagentPermissionsEnabled: true, notificationHookEnabled: true },
       "deepseek-harness": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
-      "codex": { integrationInstalled: true, enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept", nativeNotificationSoundEnabled: false },
+      "codex": { integrationInstalled: true, enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "auto", nativeNotificationSoundEnabled: false },
       "copilot-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       "cursor-agent": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       "gemini-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
@@ -460,6 +467,13 @@ const SCHEMA = {
       // hook, so permission bubbles default off. Opt-in like other non-default
       // agents — agent-gate fail-opens missing entries.
       "grok-build": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      // KiroCrew is a state-only bridge over the gateway's chat lifecycle
+      // hooks. It has no PermissionRequest and no Notification hook event, so
+      // both flags default off (like minimax). Opt-in like every other
+      // non-default agent — agent-gate.js fail-opens a MISSING entry, so this
+      // default MUST exist or startup sync would write the hooks for any user
+      // who merely has a ~/.kiro/crew directory.
+      "kirocrew": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: false },
     }),
     normalize: normalizeAgents,
   },
@@ -969,6 +983,21 @@ function migrate(raw) {
     }
     out.version = 20;
   }
+  // v20 -> v21: Codex approval routing gained Auto (#1155). save() bakes the
+  // full snapshot, so every earlier install has the old default "intercept"
+  // on disk and an explicit choice cannot be told apart from it. Move every
+  // upgrading user to Auto once; Intercept chosen after this release is kept.
+  // Fresh installs never run migrate() and already use the Auto default.
+  if (out.version < 21) {
+    const agents = out.agents;
+    const codex = agents && typeof agents === "object" && !Array.isArray(agents)
+      ? agents.codex : null;
+    if (codex && typeof codex === "object" && !Array.isArray(codex)
+      && (codex.permissionMode === "intercept" || codex.permissionMode === "native")) {
+      out.agents = { ...agents, codex: { ...codex, permissionMode: "auto" } };
+    }
+    out.version = 21;
+  }
   if ((typeof out.version === "number" ? out.version : 0) < CURRENT_VERSION) {
     out.version = CURRENT_VERSION;
   }
@@ -984,7 +1013,7 @@ const AGENT_FLAGS = [
   "notificationHookEnabled",
   "nativeNotificationSoundEnabled",
 ];
-const CODEX_PERMISSION_MODES = ["native", "intercept"];
+const CODEX_PERMISSION_MODES = ["auto", "intercept"];
 const MAX_CUSTOM_DISCOVERY_PATHS = 64;
 const MAX_CUSTOM_DISCOVERY_PATH_LENGTH = 2048;
 

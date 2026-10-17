@@ -92,6 +92,7 @@ function makeCtx(overrides = {}) {
     permLog: (message) => calls.logs.push(message),
     isAgentEnabled: () => true,
     isAgentPermissionsEnabled: () => true,
+    isCodexPermissionInterceptEnabled: () => true,
     isAgentSubagentPermissionsEnabled: () => true,
     updateSession: (...args) => calls.updateSession.push(args),
     showPermissionBubble: (entry) => calls.showPermissionBubble.push(entry),
@@ -105,7 +106,7 @@ function makeCtx(overrides = {}) {
       calls.dismissOpencodeFamilyPermissionResolvedExternally.push(payload);
       return 0;
     },
-    resolvePermissionEntry: (entry, behavior, message) => calls.resolved.push({ entry, behavior, message }),
+    resolvePermissionEntry: (entry, behavior, message, options) => calls.resolved.push({ entry, behavior, message, options }),
     maybeStartRemoteApproval: (entry) => calls.maybeStartRemoteApproval.push(entry),
     addPendingPermission(entry) {
       calls.addPendingPermission.push(entry);
@@ -284,6 +285,7 @@ describe("server-route-permission helpers", () => {
     }), true);
     assert.strictEqual(shouldBypassCopilotBubble({
       isAgentPermissionsEnabled: () => true,
+    isCodexPermissionInterceptEnabled: () => true,
     }), false);
   });
 
@@ -2498,6 +2500,36 @@ describe("server-route-permission POST", () => {
     assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, [entry]);
   });
 
+  it("carries the desktop marker into the DSH permission record only for bridge-local traffic", async () => {
+    const base = {
+      agent_id: "deepseek-harness",
+      hook_source: "dsh-plugin",
+      session_id: "deepseek-harness:carrier",
+      tool_name: "execute_shell",
+      tool_input: {},
+      dsh_carrier: "desktop",
+    };
+
+    const local = await callPermissionPost(JSON.stringify(base));
+    assert.strictEqual(local.ctx.calls.updateSession[0][3].dshCarrier, "desktop");
+    assert.strictEqual(local.ctx.pendingPermissions[0].dshCarrier, "desktop");
+
+    const web = await callPermissionPost(JSON.stringify({ ...base, dsh_carrier: "web" }));
+    assert.strictEqual(web.ctx.calls.updateSession[0][3].dshCarrier, undefined);
+    assert.strictEqual(web.ctx.pendingPermissions[0].dshCarrier, undefined);
+
+    const foreignSource = await callPermissionPost(JSON.stringify({ ...base, hook_source: "external" }));
+    assert.strictEqual(foreignSource.ctx.calls.updateSession[0][3].dshCarrier, undefined);
+
+    const remote = await callPermissionPost(JSON.stringify(base), {
+      options: { remoteProfile: { profileId: "remote-1", displayHost: "remote-host" } },
+    });
+    assert.strictEqual(remote.ctx.calls.updateSession[0][3].dshCarrier, undefined);
+
+    const wsl = await callPermissionPost(JSON.stringify({ ...base, wsl_distro: "Ubuntu" }));
+    assert.strictEqual(wsl.ctx.calls.updateSession[0][3].dshCarrier, undefined);
+  });
+
   it("leaves DSH ask_user_question with the native provider", async () => {
     const res = await callPermissionPost(JSON.stringify({
       agent_id: "deepseek-harness",
@@ -2908,6 +2940,10 @@ describe("server-route-permission POST — CC subagent requests (#451)", () => {
       assert.strictEqual(res.ctx.calls.resolved[0].entry, entry);
       assert.strictEqual(res.ctx.calls.resolved[0].behavior, "no-decision");
       assert.strictEqual(res.ctx.calls.resolved[0].message, "Client disconnected");
+      assert.deepStrictEqual(res.ctx.calls.resolved[0].options.disposition, {
+        reason: "agent_gone",
+        decided: false,
+      });
     });
   }
 

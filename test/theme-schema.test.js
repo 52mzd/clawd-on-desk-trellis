@@ -115,6 +115,41 @@ describe("theme schema validation", () => {
     }
   });
 
+  it("accepts discrete sampling only for object-channel SVGs at 1..60 integer rates", () => {
+    assert.deepStrictEqual(schema.validateTheme(validThemeJson({
+      rendering: {
+        objectChannelFiles: ["animated.svg"],
+        discreteSampling: { "animated.svg": 24 },
+      },
+    })), []);
+
+    for (const discreteSampling of [
+      { "animated.svg": 0 },
+      { "animated.svg": 61 },
+      { "animated.svg": -1 },
+      { "animated.svg": 24.5 },
+      { "animated.svg": "24" },
+      { "animated.png": 24 },
+      { "../animated.svg": 24 },
+    ]) {
+      const errors = schema.validateTheme(validThemeJson({
+        rendering: { objectChannelFiles: ["animated.svg"], discreteSampling },
+      }));
+      assert.ok(errors.some((error) => error.includes("rendering.discreteSampling")), JSON.stringify(discreteSampling));
+    }
+
+    // A declared rate on a file that never reaches the object channel is a
+    // silent no-op, so it is rejected; forcing svgChannel=object covers every
+    // file and therefore accepts the same declaration.
+    const unrouted = schema.validateTheme(validThemeJson({
+      rendering: { svgChannel: "auto", discreteSampling: { "animated.svg": 24 } },
+    }));
+    assert.ok(unrouted.some((error) => error.includes("rendering.discreteSampling")));
+    assert.deepStrictEqual(schema.validateTheme(validThemeJson({
+      rendering: { svgChannel: "object", discreteSampling: { "animated.svg": 24 } },
+    })), []);
+  });
+
   it("treats sleepSequence.mode=direct as not requiring full sleep art", () => {
     const errors = schema.validateTheme(validThemeJson({
       sleepSequence: { mode: "direct" },
@@ -726,6 +761,30 @@ describe("theme schema defaults and normalization", () => {
     assert.deepStrictEqual(normalized.rendering.objectChannelFiles, ["valid.svg"]);
   });
 
+  it("normalizes discrete sampling to SVG basenames with valid integer rates", () => {
+    const normalized = schema.mergeDefaults(validThemeJson({
+      rendering: {
+        objectChannelFiles: ["animated.svg"],
+        discreteSampling: {
+          "../animated.svg": 24,
+          "animated.svg": 24,
+          "still.png": 12,
+          "zero.svg": 0,
+          "high.svg": 61,
+          "fractional.svg": 24.5,
+        },
+      },
+    }), "external", false);
+
+    assert.deepStrictEqual(normalized.rendering.discreteSampling, { "animated.svg": 24 });
+    assert.strictEqual(
+      schema.mergeDefaults(validThemeJson({ rendering: { discreteSampling: {} } }), "external", false)
+        .rendering.discreteSampling,
+      undefined,
+      "an empty sampling map must stay absent, not become {}"
+    );
+  });
+
   it("collectRequiredAssetFiles returns unique basename-only references", () => {
     const files = schema.collectRequiredAssetFiles({
       states: { idle: ["../idle.svg"], working: ["working.svg"] },
@@ -783,6 +842,12 @@ describe("theme schema defaults and normalization", () => {
     assert.deepStrictEqual(schema.collectRequiredAssetFiles({
       rendering: { objectChannelFiles: {} },
     }), []);
+    assert.deepStrictEqual(schema.collectRequiredAssetFiles({
+      rendering: { discreteSampling: { "../sampled.svg": 24, "sampled.svg": 24 } },
+    }), ["sampled.svg"]);
+    assert.deepStrictEqual(schema.collectRequiredAssetFiles({
+      rendering: { discreteSampling: 42 },
+    }), []);
   });
 
   it("does not invent a root-viewBox usage for mini object-channel files", () => {
@@ -802,5 +867,78 @@ describe("theme schema defaults and normalization", () => {
     assert.strictEqual(usages[0].stateFamily, "mini:mini-idle");
     assert.deepStrictEqual(usages[0].effectiveViewBox, { x: 0, y: 0, width: 32, height: 32 });
     assert.ok(schema.collectRequiredAssetFiles(theme).includes("mini-idle.svg"));
+  });
+});
+
+describe("multi-file working / juggling tiers", () => {
+  it("accepts files pools, alone or next to the legacy file", () => {
+    const errors = schema.validateTheme(validThemeJson({
+      workingTiers: [
+        { minSessions: 2, files: ["two-a.svg", "two-b.svg"] },
+        { minSessions: 1, file: "one.svg", files: ["one.svg", "one-b.svg"] },
+      ],
+      jugglingTiers: [{ minSessions: 1, file: "juggle.svg" }],
+    }));
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it("rejects empty, non-array, and non-string files pools", () => {
+    const errors = schema.validateTheme(validThemeJson({
+      workingTiers: [
+        { minSessions: 3, files: [] },
+        { minSessions: 2, files: "two.svg" },
+        { minSessions: 1, file: "one.svg", files: ["one.svg", ""] },
+      ],
+      jugglingTiers: [{ minSessions: 1, files: [42] }],
+    }));
+    assert.deepStrictEqual(errors, [
+      "workingTiers[0].files must be a non-empty array of file names when present",
+      "workingTiers[1].files must be a non-empty array of file names when present",
+      "workingTiers[2].files must be a non-empty array of file names when present",
+      "jugglingTiers[0].files must be a non-empty array of file names when present",
+    ]);
+  });
+
+  it("prefers files over file and keys a tier by file when both are declared", () => {
+    assert.deepStrictEqual(schema.getTierFiles({ file: "one.svg" }), ["one.svg"]);
+    assert.deepStrictEqual(schema.getTierFiles({ file: "one.svg", files: ["a.svg", "b.svg"] }), ["a.svg", "b.svg"]);
+    assert.deepStrictEqual(schema.getTierFiles({ files: [], file: "one.svg" }), ["one.svg"]);
+    assert.deepStrictEqual(schema.getTierFiles(null), []);
+    assert.strictEqual(schema.getTierKeyFile({ file: "one.svg", files: ["a.svg", "b.svg"] }), "one.svg");
+    assert.strictEqual(schema.getTierKeyFile({ files: ["a.svg", "b.svg"] }), "a.svg");
+    assert.strictEqual(schema.getTierKeyFile({}), null);
+  });
+
+  it("basenames every pool file during normalization", () => {
+    const theme = schema.mergeDefaults(validThemeJson({
+      workingTiers: [{ minSessions: 1, file: "../one.svg", files: ["../one.svg", "nested/two.svg"] }],
+      jugglingTiers: [{ minSessions: 1, files: ["..\\juggle.svg"] }],
+    }), "demo", false);
+    assert.strictEqual(theme.workingTiers[0].file, "one.svg");
+    assert.deepStrictEqual(theme.workingTiers[0].files, ["one.svg", "two.svg"]);
+    assert.deepStrictEqual(theme.jugglingTiers[0].files, ["juggle.svg"]);
+  });
+
+  it("treats every pool file as a reachable, required visual", () => {
+    const cfg = {
+      states: { idle: ["idle.svg"] },
+      workingTiers: [{ minSessions: 1, file: "legacy-only.svg", files: ["../work-a.svg", "work-b.svg"] }],
+      jugglingTiers: [{ minSessions: 1, files: ["juggle-a.svg", "juggle-b.svg"] }],
+    };
+    assert.deepStrictEqual(schema.collectRequiredAssetFiles(cfg).sort(), [
+      "idle.svg",
+      "juggle-a.svg",
+      "juggle-b.svg",
+      "work-a.svg",
+      "work-b.svg",
+    ]);
+    const tierUsages = schema.projectThemeVisualUsages(cfg)
+      .filter((usage) => usage.source === "workingTiers" || usage.source === "jugglingTiers");
+    assert.deepStrictEqual(tierUsages.map((usage) => [usage.stateFamily, usage.file]), [
+      ["normal:workingTiers", "work-a.svg"],
+      ["normal:workingTiers", "work-b.svg"],
+      ["normal:jugglingTiers", "juggle-a.svg"],
+      ["normal:jugglingTiers", "juggle-b.svg"],
+    ]);
   });
 });

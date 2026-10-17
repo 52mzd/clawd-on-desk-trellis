@@ -22,6 +22,7 @@ const {
   sessionDisplayTitle,
   normalizeTitle,
 } = require("../src/state-session-snapshot");
+const { getFocusableLocalHudSessionIds } = require("../src/session-focus");
 const { makeSessionKey } = require("../src/session-key");
 const { sessionAliasKey } = require("../src/session-alias");
 
@@ -124,6 +125,18 @@ describe("startup-recovered session snapshots", () => {
     assert.strictEqual(recovered.sessions[0].focusTarget, null);
     assert.strictEqual(live.sessions[0].startupRecovered, false);
     assert.notStrictEqual(sessionSnapshotSignature(recovered), sessionSnapshotSignature(live));
+  });
+
+  it("does not expose the internal prompt-derived title flag (#1125)", () => {
+    const snapshot = buildSessionSnapshot(new Map([
+      ["real-session", session("working", {
+        sessionTitle: "Prompt line",
+        sessionTitleFromPrompt: true,
+      })],
+    ]), { statePriority: STATE_PRIORITY });
+
+    assert.strictEqual(snapshot.sessions[0].sessionTitle, "Prompt line");
+    assert.ok(!("sessionTitleFromPrompt" in snapshot.sessions[0]));
   });
 });
 
@@ -779,6 +792,61 @@ describe("state-session-snapshot builder", () => {
       url: "codex://threads/019e115a-4df2-7ed0-b90e-8e6345aca777",
     });
     assert.strictEqual(byId.get(scopedCodexSessionId).codexSource, "vscode");
+  });
+
+  it("offers the terminal jump for a herdr-hosted session with a Desktop originator (#1139)", () => {
+    const snapshot = buildSessionSnapshot(new Map([
+      ["codex:019e115a-4df2-7ed0-b90e-8e6345aca777", session("working", {
+        agentId: "codex",
+        codexOriginator: "codex_work_desktop",
+        sourcePid: 900,
+        herdrPaneId: "w1:p1",
+        herdrSocket: "/tmp/herdr.sock",
+      })],
+    ]), { focusHostPlatform: "darwin" });
+
+    const [entry] = snapshot.sessions;
+    assert.strictEqual(entry.canFocus, true);
+    // The Dashboard button label follows this type: "terminal" renders the
+    // terminal jump, "codex-thread" the "open Codex session" deep link.
+    assert.deepStrictEqual(entry.focusTarget, { type: "terminal", url: null });
+  });
+
+  it("exposes the DSH desktop carrier and moves the signature when it changes", () => {
+    const carrierSession = session("working", {
+      agentId: "deepseek-harness",
+      dshCarrier: "desktop",
+    });
+    const snapshot = buildSessionSnapshot(new Map([["dsh", carrierSession]]), {
+      focusHostPlatform: "darwin",
+    });
+    const entry = snapshot.sessions.find((item) => item.id === "dsh");
+    assert.strictEqual(entry.dshCarrier, "desktop");
+    assert.strictEqual(entry.canFocus, true);
+    assert.deepStrictEqual(entry.focusTarget, { type: "dsh-desktop", url: "dsh://open" });
+
+    const withoutCarrier = buildSessionSnapshot(new Map([[
+      "dsh",
+      session("working", { agentId: "deepseek-harness" }),
+    ]]), { focusHostPlatform: "darwin" });
+    assert.strictEqual(withoutCarrier.sessions[0].dshCarrier, null);
+    assert.strictEqual(withoutCarrier.sessions[0].canFocus, false);
+    assert.notStrictEqual(sessionSnapshotSignature(snapshot), sessionSnapshotSignature(withoutCarrier));
+  });
+
+  it("moves the snapshot signature when only the DSH carrier differs", () => {
+    // On Linux the carrier grants no focus target, so canFocus and focusTarget
+    // are identical in both snapshots; only the raw dshCarrier field differs.
+    const withCarrier = buildSessionSnapshot(new Map([
+      ["dsh", session("working", { agentId: "deepseek-harness", dshCarrier: "desktop" })],
+    ]), { focusHostPlatform: "linux" });
+    const withoutCarrier = buildSessionSnapshot(new Map([
+      ["dsh", session("working", { agentId: "deepseek-harness" })],
+    ]), { focusHostPlatform: "linux" });
+
+    assert.strictEqual(withCarrier.sessions[0].canFocus, withoutCarrier.sessions[0].canFocus);
+    assert.deepStrictEqual(withCarrier.sessions[0].focusTarget, withoutCarrier.sessions[0].focusTarget);
+    assert.notStrictEqual(sessionSnapshotSignature(withCarrier), sessionSnapshotSignature(withoutCarrier));
   });
 
   it("exposes Codex Desktop thread focus targets on Windows snapshots", () => {
@@ -1439,5 +1507,48 @@ describe("shouldAutoClearDetachedSession WSL guard", () => {
     );
     assert.strictEqual(hidden, true);
     assert.strictEqual(probes, 1);
+  });
+});
+
+describe("awaiting-activity rows", () => {
+  it("counts only the conversation the user has touched as a pet-body jump target", () => {
+    const snapshot = buildSessionSnapshot(new Map([
+      ["dsh-active", session("working", {
+        agentId: "deepseek-harness",
+        dshCarrier: "desktop",
+        awaitingActivity: false,
+        sourcePid: 999,
+      })],
+      ["dsh-fresh", session("idle", {
+        agentId: "deepseek-harness",
+        dshCarrier: "desktop",
+        awaitingActivity: true,
+        sourcePid: 998,
+      })],
+      ["kimi-active", session("working", {
+        agentId: "kimi-cli",
+        awaitingActivity: false,
+        sourcePid: 997,
+      })],
+      ["kimi-fresh", session("idle", {
+        agentId: "kimi-cli",
+        awaitingActivity: true,
+        sourcePid: 996,
+      })],
+    ]), { statePriority: STATE_PRIORITY, focusHostPlatform: "darwin" });
+
+    assert.deepStrictEqual(
+      snapshot.sessions.map((entry) => entry.id).sort(),
+      ["dsh-active", "dsh-fresh", "kimi-active", "kimi-fresh"],
+      "the Dashboard still lists both conversations"
+    );
+    assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "dsh-fresh").hiddenFromHud, true);
+    assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "dsh-fresh").canFocus, true);
+    assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "kimi-fresh").hiddenFromHud, true);
+    assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "kimi-fresh").canFocus, true);
+    assert.deepStrictEqual(
+      getFocusableLocalHudSessionIds(snapshot, { osPlatform: "darwin" }),
+      ["dsh-active", "kimi-active"]
+    );
   });
 });

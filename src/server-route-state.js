@@ -14,11 +14,15 @@ const {
 } = require("../hooks/server-config");
 const { isCodexDesktopOriginator } = require("../hooks/codex-originator");
 const {
+  CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+} = require("../hooks/codex-internal-worker");
+const {
   assessWindowsProcessChainRequest,
   buildShadowComparison,
   processMetadataForState,
 } = require("./server-windows-process-metadata");
 const { isWslSourced, stripRemoteProcessMetadata } = require("./remote-process-metadata");
+const { resolveDshCarrier } = require("./dsh-carrier");
 const {
   normalizeHookToolUseId,
   findPendingPermissionForStateEvent,
@@ -35,6 +39,7 @@ const {
   resolveHookAgentId,
 } = require("./server-agent-id");
 const { resolveCodexOfficialHookState } = require("./server-codex-official-turns");
+const { normalizeClaudePhaseId, normalizeClaudeBatchToolUseIds } = require("../hooks/claude-tool-batch");
 const { normalizeTranscriptPath } = require("./transcript-path");
 const { normalizeQuotaGroup } = require("../hooks/quota-bucket");
 const { ANTIGRAVITY_QUOTA_FIELDS } = require("../hooks/antigravity-context-usage");
@@ -43,6 +48,13 @@ const { CODEX_QUOTA_FIELDS } = require("../hooks/codex-rate-limits");
 const { extractPermissionToolInput } = require("../hooks/kimi-hook");
 const { normalizeCodexUserInputWire } = require("../hooks/codex-user-input");
 const { sanitizeShadowRecord } = require("./windows-process-chain-shadow-log");
+
+const NATIVE_TERMINAL_ANSWER_OPTIONS = Object.freeze({
+  disposition: Object.freeze({ reason: "handed_to_terminal", decided: true }),
+});
+const SESSION_ENDED_OPTIONS = Object.freeze({
+  disposition: Object.freeze({ reason: "agent_gone", decided: false }),
+});
 
 // /state POST body size cap. Raised 1024 → 4096 → 16384: a CJK
 // assistant_last_output (3 UTF-8 bytes/char) on a Stop completion blew past
@@ -113,6 +125,17 @@ function normalizeOrcaPaneKey(value) {
   return /^[\w-]+:[\w-]+$/.test(text) ? text : null;
 }
 
+// herdr pane ids look like "w5:p4" (#1139); same shape check as the Orca key.
+const normalizeHerdrPaneId = normalizeOrcaPaneKey;
+
+// Absolute socket path only: it is handed to the herdr CLI as HERDR_SOCKET_PATH.
+function normalizeHerdrSocket(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text || text.length > 4096 || !text.startsWith("/")) return null;
+  return /[\0\r\n]/.test(text) ? null : text;
+}
+
 function normalizeAssistantLastOutput(value) {
   if (typeof value !== "string") return null;
   const text = value
@@ -142,7 +165,7 @@ function normalizeContextUsage(value) {
     out.percent = Math.max(0, Math.min(100, Math.round((used / out.limit) * 100)));
   }
 
-  if (value.source === "claude" || value.source === "codex" || value.source === "antigravity" || value.source === "opencode") out.source = value.source;
+  if (value.source === "claude" || value.source === "codex" || value.source === "antigravity" || value.source === "opencode" || value.source === "workbuddy") out.source = value.source;
   return out;
 }
 
@@ -266,6 +289,8 @@ function handleStatePost(req, res, options) {
         editor,
         tmuxSocket,
         tmuxClient,
+        herdrPaneId,
+        herdrSocket,
       } = stripRemoteProcessMetadata({
         sourcePid: Number.isFinite(data.source_pid) && data.source_pid > 0 ? Math.floor(data.source_pid) : null,
         wtHwnd: rawWtHwnd,
@@ -274,6 +299,8 @@ function handleStatePost(req, res, options) {
         editor: (data.editor === "code" || data.editor === "cursor") ? data.editor : null,
         tmuxSocket: normalizeTmuxSocket(data.tmux_socket),
         tmuxClient: normalizeTmuxClient(data.tmux_client),
+        herdrPaneId: normalizeHerdrPaneId(data.herdr_pane_id),
+        herdrSocket: normalizeHerdrSocket(data.herdr_socket),
       }, remoteProfile, wslSourced);
       // Intentional exception to the WSL PID strip: per-session automation
       // eligibility only strips Remote SSH, never WSL, to preserve the pre-fix
@@ -419,11 +446,25 @@ function handleStatePost(req, res, options) {
       const toolInputFingerprint = typeof data.tool_input_fingerprint === "string" && data.tool_input_fingerprint
         ? data.tool_input_fingerprint
         : null;
+      const claudePromptId = agentId === "claude-code" ? normalizeClaudePhaseId(data.prompt_id) : null;
+      const batchToolUseIds = event === "PostToolBatch" ? normalizeClaudeBatchToolUseIds(data.tool_use_ids) : null;
+      if (event === "PostToolBatch" && (agentId !== "claude-code" || !claudePromptId
+        || !batchToolUseIds || subagentId || svg || state !== "thinking"
+        || (ctx.pendingPermissions || []).some((perm) => perm && perm.res
+          && perm.sessionId === session_id && perm.agentId === "claude-code"))) {
+        res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+        res.end();
+        return;
+      }
       // Session title (Claude Code /rename or Codex turn_context.summary).
       // Non-string / empty values are silently dropped - matches the
       // "ignore + fall back" pattern used by cwd / agent_id above.
       const rawTitle = typeof data.session_title === "string" ? data.session_title.trim() : "";
       const sessionTitle = rawTitle || null;
+      // A title derived from the prompt's first line is only a fallback: flag
+      // it so the state machine never lets it displace a formal title.
+      const sessionTitleFromPrompt =
+        sessionTitle !== null && data.session_title_from_prompt === true;
       const contextUsage = normalizeContextUsage(data.context_usage);
       const antigravityQuota = normalizeAntigravityQuota(data.antigravity_quota);
       const claudeQuota = normalizeClaudeQuota(data.claude_quota);
@@ -468,11 +509,34 @@ function handleStatePost(req, res, options) {
       // around the full updateSession lifecycle machine.
       const metadataOnly = data.metadata_only === true;
       const hookSource = typeof data.hook_source === "string" ? data.hook_source : null;
+      // The hook tags a recognized Codex Desktop ambient-suggestion thread.
+      // Only a local, official Codex state event may carry it — remote/WSL and
+      // other agents never do — and the value is re-validated at this trust
+      // boundary rather than trusted from the hook.
+      const codexInternalThread = data.codex_internal_thread === CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS
+        && agentId === "codex"
+        && hookSource === "codex-official"
+        && trustedProfileId === "local"
+        && !host
+        && !wslDistro
+        ? CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS
+        : null;
       const clearDshContextUsage = metadataOnly
         && agentId === "deepseek-harness"
         && hookSource === "dsh-plugin"
         && Object.hasOwn(data, "context_usage")
         && data.context_usage === null;
+      // The desktop app's bridge marks its traffic with a carrier. Only the DSH
+      // bridge's own local, non-WSL requests may carry it (shared rule below);
+      // metadata-only requests never reach the lifecycle update, so they can
+      // never change where a session came from.
+      const dshCarrier = resolveDshCarrier({
+        agentId,
+        hookSource,
+        value: data.dsh_carrier,
+        remoteProfile,
+        wslSourced,
+      });
       // #406 completion-gate inputs from the Claude Stop hook. Counts / boolean
       // only — the hook never forwards task command or description text.
       const backgroundTasksCount = Number.isFinite(data.background_tasks_count)
@@ -639,7 +703,10 @@ function handleStatePost(req, res, options) {
           // OpenCode title changes ride the same metadata-only channel (the
           // placeholder → real title swap arrives on session.updated, which
           // maps to no Clawd state). Not gated on the Claude telemetry flag —
-          // it's not Claude statusline data.
+          // it's not Claude statusline data. A metadata-only title is always
+          // formal: only hooks/clawd-hook.js and hooks/workbuddy-hook.js send
+          // session_title_from_prompt, and neither sends it on a metadata-only
+          // request, so any marker here is ignored.
           if (sessionTitle) metaUpdate.sessionTitle = sessionTitle;
           // DSH metadata bypasses the lifecycle sequence fence, so it must
           // only ever annotate DSH's own session. Pass the expected owner so
@@ -889,6 +956,19 @@ function handleStatePost(req, res, options) {
         if (event === "UserPromptSubmit" && typeof ctx.debugLog === "function") {
           ctx.debugLog(`wt-hwnd sid=${sid} event=${event} source=${wtHwndSource}`);
         }
+        // Consume phase evidence only after enablement, metadata-only and
+        // state validation gates, and before any permission-side effects.
+        const claudeToolPhaseDecision = agentId === "claude-code"
+          && typeof ctx.observeClaudeToolPhase === "function"
+          ? ctx.observeClaudeToolPhase(sid, event, { agentId, toolUseId,
+              claudePromptId, batchToolUseIds, subagentId, subagentLifecycleSource, headless: effHeadless })
+          : null;
+        if (claudeToolPhaseDecision && !claudeToolPhaseDecision.accept) {
+          res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+          res.end();
+          return;
+        }
+        const isRetiredClaudePhase = !!(claudeToolPhaseDecision && claudeToolPhaseDecision.retired);
         const stateEventInteraction = classifyPermissionInteraction({
           agentId,
           toolName,
@@ -925,7 +1005,12 @@ function handleStatePost(req, res, options) {
           const behavior = typeof behaviorFor === "function"
             ? behaviorFor(candidates[0])
             : behaviorFor;
-          ctx.resolvePermissionEntry(candidates[0], behavior, message);
+          ctx.resolvePermissionEntry(
+            candidates[0],
+            behavior,
+            message,
+            NATIVE_TERMINAL_ANSWER_OPTIONS
+          );
         };
         const permissionLifecycleEvent = event === "PostToolUse"
           || event === "PostToolUseFailure"
@@ -945,11 +1030,16 @@ function handleStatePost(req, res, options) {
             subagentId,
             toolName,
             toolUseId,
-            toolInputFingerprint,
-            allowSingletonFallback: event === "Stop",
+            toolInputFingerprint: isRetiredClaudePhase ? null : toolInputFingerprint,
+            allowSingletonFallback: event === "Stop" && !isRetiredClaudePhase,
           });
           if (perm) {
-            ctx.resolvePermissionEntry(perm, stateSweepBehaviorFor(perm), "User answered in terminal");
+            ctx.resolvePermissionEntry(
+              perm,
+              stateSweepBehaviorFor(perm),
+              "User answered in terminal",
+              NATIVE_TERMINAL_ANSWER_OPTIONS
+            );
           }
           // A later hook event may be the only evidence that the user answered
           // a decision in the agent's native terminal UI. Never sweep across
@@ -958,7 +1048,7 @@ function handleStatePost(req, res, options) {
           // An exact match already identifies which decision completed. Do
           // not infer that a sibling decision from the same session/subagent
           // also completed — concurrent questions can legitimately coexist.
-          if (!perm || !isDecisionInteraction(perm.interaction)) {
+          if (!isRetiredClaudePhase && (!perm || !isDecisionInteraction(perm.interaction))) {
             const staleDecisions = pendingForSource().filter((stale) => (
               stale !== perm && isDecisionInteraction(stale.interaction)
             ));
@@ -985,9 +1075,14 @@ function handleStatePost(req, res, options) {
           for (const stale of sessionEndPending.filter((entry) => (
             isDecisionInteraction(entry.interaction)
           ))) {
-            ctx.resolvePermissionEntry(stale, "no-decision", "Session ended");
+            ctx.resolvePermissionEntry(
+              stale,
+              "no-decision",
+              "Session ended",
+              SESSION_ENDED_OPTIONS
+            );
           }
-        } else if (hasExplicitPermissionLifecycleSession && (
+        } else if (hasExplicitPermissionLifecycleSession && !isRetiredClaudePhase && (
           event === "UserPromptSubmit"
           || (
             event === "PreToolUse"
@@ -1006,7 +1101,7 @@ function handleStatePost(req, res, options) {
         }
         recordRequestHookEvent.acceptedUnlessDnd(shouldDropForDnd());
         let sessionUpdateApplied = true;
-        if (svg) {
+        if (svg && !(claudeToolPhaseDecision && claudeToolPhaseDecision.preservePhase)) {
           const safeSvg = pathApi.basename(svg);
           ctx.setState(state, safeSvg);
         } else {
@@ -1019,6 +1114,8 @@ function handleStatePost(req, res, options) {
             tmuxSocket,
             tmuxClient,
             orcaPaneKey,
+            herdrPaneId,
+            herdrSocket,
             agentPid: effectiveProcessMetadata.agentPid,
             agentId,
             ...(subagentId ? { subagentId } : {}),
@@ -1037,15 +1134,20 @@ function handleStatePost(req, res, options) {
             provider,
             codexOriginator,
             codexSource,
+            dshCarrier,
             ghosttyTerminalId,
             displayHint: display_svg,
             sessionTitle,
+            sessionTitleFromPrompt,
             contextUsage,
             contextUsageOrigin: resolveStateContextUsageOrigin(agentId, contextUsage),
             assistantLastOutput,
             assistantLastOutputTruncated,
             toolName,
             ...(toolUseId ? { toolUseId } : {}),
+            ...(claudePromptId ? { claudePromptId } : {}),
+            ...(batchToolUseIds ? { batchToolUseIds } : {}),
+            ...(claudeToolPhaseDecision ? { claudeToolPhaseDecision } : {}),
             transcriptPath,
             permissionSuspect,
             permissionAction,
@@ -1056,6 +1158,7 @@ function handleStatePost(req, res, options) {
             permissionGateId,
             preserveState,
             hookSource,
+            ...(codexInternalThread ? { codexInternalThread } : {}),
             ...(codexHookState.turnId ? { turnId: codexHookState.turnId } : {}),
             ...(codexHookState.turnId ? { recapDedupeId: codexHookState.turnId } : {}),
             backgroundTasksCount,
@@ -1075,7 +1178,7 @@ function handleStatePost(req, res, options) {
         // Decorative only: the lifecycle update above remains authoritative.
         // Main owns the opt-in / DND / visibility / mini / drag gate; a visual
         // failure must never turn a valid hook state POST into a 400.
-        if (testResult && typeof ctx.handleTestResult === "function") {
+        if (testResult && !isRetiredClaudePhase && typeof ctx.handleTestResult === "function") {
           try {
             ctx.handleTestResult(testResult, {
               sessionId: sid,

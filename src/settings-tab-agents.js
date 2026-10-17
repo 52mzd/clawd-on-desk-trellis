@@ -11,7 +11,7 @@
   let helpers = null;
   let ops = null;
   const CODEX_PERMISSION_MODE_OPTIONS = [
-    { id: "native", labelKey: "codexPermissionModeNative" },
+    { id: "auto", labelKey: "codexPermissionModeAuto" },
     { id: "intercept", labelKey: "codexPermissionModeIntercept" },
   ];
   const INSTALL_HINT_CONFIDENCES = new Set(["high", "medium"]);
@@ -20,7 +20,10 @@
   let agentInstallHintResetPending = false;
   let agentCleanupHintResetPending = false;
   let codexHookHealthRequestSeq = 0;
+  const permissionModePending = new Set();
   let claudeHookHealthRequestSeq = 0;
+  let dshNoticesRequestSeq = 0;
+  const dshNoticeContainers = new Set();
 
   function t(key) {
     return helpers.t(key);
@@ -49,7 +52,10 @@
     const categorized = categorizeAgentsForSections(agents);
     const subtab = resolveAgentsSubtab(categorized);
 
-    parent.appendChild(buildAgentSubtabRow(subtab, categorized));
+    const switcher = buildAgentSubtabRow(subtab, categorized);
+    parent.appendChild(switcher.row);
+    for (const panel of switcher.control.panels.values()) parent.appendChild(panel);
+    parent = switcher.control.panels.get(subtab);
 
     // Each banner lives in the subtab it acts on: "install what we detected"
     // is what the discover subtab is for, and "your integration outlived its
@@ -135,19 +141,17 @@
       count.textContent = String(shown);
     }
 
-    const search = document.createElement("input");
-    search.type = "search";
-    search.className = "agent-section-search";
-    search.placeholder = t("agentSearchPlaceholder");
-    search.value = runtime.agentsUnavailableQuery || "";
-    // The input sits inside the collapsible header, whose click and Enter/Space
-    // handlers would otherwise toggle the group out from under the typist.
-    const stopHeaderToggle = (event) => {
-      if (event && typeof event.stopPropagation === "function") event.stopPropagation();
-    };
-    search.addEventListener("click", stopHeaderToggle);
-    search.addEventListener("keydown", stopHeaderToggle);
-
+    const search = helpers.buildTextInput({
+      type: "search",
+      size: "compact",
+      className: "agent-section-search",
+      placeholder: t("agentSearchPlaceholder"),
+      ariaLabel: t("agentSearchPlaceholder"),
+      value: runtime.agentsUnavailableQuery || "",
+      stopPropagation: true,
+    });
+    // The input sits inside the collapsible header, so the shared primitive
+    // stops click/keydown propagation before the header can toggle.
     function commitQuery(event) {
       runtime.agentsUnavailableQuery = (event && event.target && event.target.value) || "";
       applyFilter();
@@ -316,36 +320,32 @@
     const row = document.createElement("div");
     row.className = "agents-subtabs";
 
-    const group = document.createElement("div");
-    group.className = "segmented";
-    group.setAttribute("role", "tablist");
     const entries = [
       { key: "connected", label: t("agentsSubtabConnected"), count: 0 },
       // Counts what the user can act on right now, so the badge stays a
       // to-do marker: agents detected locally but not connected yet.
       { key: "discover", label: t("agentsSubtabDiscover"), count: categorized.recommended.length },
     ];
-    for (const entry of entries) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = entry.label;
-      btn.setAttribute("role", "tab");
-      btn.setAttribute("aria-selected", entry.key === current ? "true" : "false");
-      if (entry.key === current) btn.classList.add("active");
-      if (entry.count > 0) {
-        const badge = document.createElement("span");
-        badge.className = "agents-subtab-count";
-        badge.textContent = String(entry.count);
-        btn.appendChild(badge);
-      }
-      btn.addEventListener("click", () => {
-        if (runtime.agentsSubtab === entry.key) return;
-        runtime.agentsSubtab = entry.key;
+    const control = helpers.buildTabs({
+      id: "settings-agents",
+      ariaLabel: t("agentsTitle"),
+      value: current,
+      options: entries.map((entry) => ({ ...entry, value: entry.key })),
+      renderLabel(btn, entry) {
+        if (entry.count > 0) {
+          const badge = document.createElement("span");
+          badge.className = "agents-subtab-count";
+          badge.textContent = String(entry.count);
+          btn.appendChild(badge);
+        }
+      },
+      onChange(value) {
+        runtime.agentsSubtab = value;
         ops.requestRender({ content: true });
-      });
-      group.appendChild(btn);
-    }
-    row.appendChild(group);
+      },
+    });
+    helpers.registerMountedDisposable(control);
+    row.appendChild(control.element);
 
     // WSL rescan belongs to the connected subtab: it re-detects built-in
     // agents installed inside distros, and its results render as instance rows
@@ -354,7 +354,7 @@
       const wslScanControl = buildWslScanControl();
       if (wslScanControl) row.appendChild(wslScanControl);
     }
-    return row;
+    return { row, control };
   }
 
   function buildCustomToolsSection() {
@@ -1039,6 +1039,156 @@
     });
   }
 
+  // Failure reasons a Repair run can actually resolve; anything else needs
+  // manual inspection, so promising a Fix would be misleading.
+  const DSH_REPAIRABLE_FAILURE_REASONS = new Set([
+    "plugin-disabled-in-dsh",
+    "repair-pending",
+    "inspection-required",
+  ]);
+
+  function dshNoticeProfileLabel(profile) {
+    return t(profile === "desktop" ? "dshNoticeProfileDesktop" : "dshNoticeProfileWeb");
+  }
+
+  function dshNoticeBody(notice) {
+    switch (notice.kind) {
+      case "restart-required":
+        return t("dshNoticeRestartRequired");
+      case "first-install":
+        return t("dshNoticeFirstInstall");
+      case "manual-command":
+        return t("dshNoticeManualCommand");
+      case "failed-target": {
+        if (notice.reason === "generation-conflict") return t("dshNoticeGenerationConflict");
+        const message = notice.message == null ? "" : String(notice.message);
+        const key = notice.operation === "uninstall" ? "dshNoticeUninstallFailed" : "dshNoticeInstallFailed";
+        let body = t(key).replace("{message}", message);
+        if (DSH_REPAIRABLE_FAILURE_REASONS.has(notice.reason)) {
+          body = `${body} ${t("dshNoticeOpenDoctor").replace("{fix}", t("doctorFix"))}`;
+        }
+        return body;
+      }
+      default:
+        return "";
+    }
+  }
+
+  function buildDshNoticeActions(container, notice) {
+    const actions = document.createElement("div");
+    actions.className = "agent-dsh-notice-actions";
+    if (notice.kind === "manual-command") {
+      const copy = helpers.buildButton({
+        labelKey: "dshNoticeCopy",
+        size: "compact",
+        className: "agent-dsh-notice-copy",
+      });
+      copy.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        copyDshNoticeCommands(notice, copy);
+      });
+      actions.appendChild(copy);
+    }
+    const ack = helpers.buildButton({
+      labelKey: "dshNoticeAcknowledge",
+      size: "compact",
+      className: "agent-dsh-notice-ack",
+    });
+    ack.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      acknowledgeDshNoticeRow(container, notice, ack);
+    });
+    actions.appendChild(ack);
+    return actions;
+  }
+
+  function buildDshNoticeRow(container, notice) {
+    const row = document.createElement("div");
+    row.className = "agent-dsh-notice";
+    row.setAttribute("data-kind", notice.kind);
+    row.setAttribute("data-profile", notice.profile);
+    const line = document.createElement("div");
+    line.className = "agent-dsh-notice-line";
+    line.textContent = t("dshNoticeLine")
+      .replace("{profile}", dshNoticeProfileLabel(notice.profile))
+      .replace("{text}", dshNoticeBody(notice));
+    row.appendChild(line);
+    if (notice.kind === "manual-command") {
+      const commands = document.createElement("pre");
+      commands.className = "agent-dsh-notice-commands";
+      commands.textContent = (notice.commands || []).join("\n");
+      row.appendChild(commands);
+    }
+    row.appendChild(buildDshNoticeActions(container, notice));
+    container.appendChild(row);
+  }
+
+  // Copy-only by design: the command mutates the user's DSH install, so Clawd
+  // hands it over instead of running it.
+  async function copyDshNoticeCommands(notice, button) {
+    helpers.setButtonState(button, { pending: true });
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText((notice.commands || []).join("\n"));
+      ops.showToast(t("dshNoticeCopied"));
+    } catch (err) {
+      ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+    } finally {
+      helpers.setButtonState(button, { pending: false });
+    }
+  }
+
+  async function acknowledgeDshNoticeRow(container, notice, button) {
+    helpers.setButtonState(button, { pending: true });
+    try {
+      const result = await window.settingsAPI.acknowledgeDshNotice(notice.profile, notice.id);
+      if (!result || result.status !== "ok") throw new Error((result && result.message) || "acknowledge failed");
+      await refreshDshNotices(container);
+    } catch (err) {
+      ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+      helpers.setButtonState(button, { pending: false });
+    }
+  }
+
+  async function refreshDshNotices(container) {
+    // The initial fetch starts while the row is still detached, so only the
+    // response is gated on the container still being on the page.
+    if (!container) return;
+    const seq = String(++dshNoticesRequestSeq);
+    container.dataset.dshNoticeSeq = seq;
+    try {
+      const result = await window.settingsAPI.getDshNotices();
+      if (container.isConnected === false) return;
+      if (container.dataset.dshNoticeSeq !== seq) return;
+      const notices = result && Array.isArray(result.notices) ? result.notices : [];
+      container.textContent = "";
+      for (const notice of notices) buildDshNoticeRow(container, notice);
+    } catch {
+      // Keep whatever is already shown; a transient IPC failure is not a row.
+    }
+  }
+
+  function refreshMountedDshNotices() {
+    for (const container of [...dshNoticeContainers]) {
+      if (container.isConnected === false) {
+        dshNoticeContainers.delete(container);
+        continue;
+      }
+      refreshDshNotices(container);
+    }
+  }
+
+  function buildDshNotices(agent, text) {
+    if (agent.custom || agent.id !== "deepseek-harness") return;
+    const container = document.createElement("div");
+    container.className = "agent-dsh-notices";
+    text.appendChild(container);
+    dshNoticeContainers.add(container);
+    refreshDshNotices(container);
+  }
+
   function buildAgentMasterRow(agent) {
     let integrationBadge = null;
     return buildAgentSwitchRow({
@@ -1108,6 +1258,7 @@
           hint.textContent = t("minimaxEnableHint");
           text.appendChild(hint);
         }
+        buildDshNotices(agent, text);
       },
       buildExtraControls: (ctrl) => {
         if (agent.custom) {
@@ -1372,17 +1523,18 @@
     statusLine.textContent = t("kimiQuotaStatusLoading");
     card.appendChild(statusLine);
 
-    function makePasswordInput() {
-      const input = document.createElement("input");
-      input.type = "password";
-      input.className = "kimi-quota-key-input";
-      input.placeholder = t("kimiQuotaApiKeyPlaceholder");
-      input.autocomplete = "new-password";
-      input.spellcheck = false;
-      input.setAttribute("aria-label", t("kimiQuotaApiKeyPlaceholder"));
-      input.addEventListener("click", (event) => event.stopPropagation());
-      input.addEventListener("keydown", (event) => event.stopPropagation());
-      return input;
+    function makePasswordInput(onEnter) {
+      return helpers.buildTextInput({
+        type: "password",
+        className: "kimi-quota-key-input",
+        placeholder: t("kimiQuotaApiKeyPlaceholder"),
+        autocomplete: "new-password",
+        spellcheck: false,
+        ariaLabel: t("kimiQuotaApiKeyPlaceholder"),
+        stopPropagation: true,
+        onEnter,
+        onInput: (event) => helpers.setTextInputState(event.currentTarget, { invalid: false }),
+      });
     }
 
     function makeConsoleLink() {
@@ -1409,7 +1561,9 @@
     connectSection.hidden = true;
     const connectRow = document.createElement("div");
     connectRow.className = "kimi-quota-connect-row";
-    const connectInput = makePasswordInput();
+    const connectInput = makePasswordInput((_event, input) => {
+      submitKey(input, (apiKey) => window.settingsAPI.connectKimiQuota(apiKey));
+    });
     const connectButton = helpers.buildButton({
       labelKey: "kimiQuotaConnect",
       tone: "accent",
@@ -1471,7 +1625,9 @@
     const replacePanel = document.createElement("div");
     replacePanel.className = "kimi-quota-replace";
     replacePanel.hidden = true;
-    const replaceInput = makePasswordInput();
+    const replaceInput = makePasswordInput((_event, input) => {
+      submitKey(input, (apiKey) => window.settingsAPI.connectKimiQuota(apiKey));
+    });
     replacePanel.appendChild(replaceInput);
     const replaceActions = document.createElement("div");
     replaceActions.className = "kimi-quota-replace-actions";
@@ -1568,8 +1724,8 @@
         disabled: busy,
         pending: pendingButton === connectButton,
       });
-      connectInput.disabled = busy;
-      replaceInput.disabled = busy;
+      helpers.setTextInputState(connectInput, { pending: busy });
+      helpers.setTextInputState(replaceInput, { pending: busy });
       helpers.setButtonState(replaceConfirm, {
         disabled: busy,
         pending: pendingButton === replaceConfirm,
@@ -1631,6 +1787,8 @@
       const apiKey = input.value;
       input.value = "";
       if (!apiKey) {
+        helpers.setTextInputState(input, { invalid: true });
+        input.focus();
         ops.showToast(t("kimiQuotaKeyRequired"), { error: true });
         return;
       }
@@ -1669,13 +1827,6 @@
       if (typeof window.confirm === "function" && !window.confirm(t("kimiQuotaForgetConfirm"))) return;
       runAction(() => window.settingsAPI.forgetKimiQuotaCredential(), forgetButton);
     });
-    connectInput.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") submitKey(connectInput, (apiKey) => window.settingsAPI.connectKimiQuota(apiKey));
-    });
-    replaceInput.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") submitKey(replaceInput, (apiKey) => window.settingsAPI.connectKimiQuota(apiKey));
-    });
-
     syncControls();
     void reloadStatus();
     return card;
@@ -1903,11 +2054,8 @@
     if (flag === "enabled") return false;
     const masterOn = readers.readAgentFlagValue(agentId, "enabled");
     if (!masterOn) return true;
-    if (agentId === "codex" && flag === "permissionsEnabled") {
-      return readers.readAgentPermissionMode(agentId) !== "intercept";
-    }
     if (agentId === "codex" && flag === "nativeNotificationSoundEnabled") {
-      return readers.readAgentPermissionMode(agentId) !== "native";
+      return readers.readAgentPermissionMode(agentId) !== "auto";
     }
     // Subagent sub-gate sits under the permission switch: pointless to toggle
     // while the parent permission gate already suppresses every CC bubble.
@@ -1935,70 +2083,48 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const segmented = document.createElement("div");
-    segmented.className = "segmented codex-permission-mode-segmented";
-    segmented.setAttribute("role", "tablist");
-    const current = readers.readAgentPermissionMode(agent.id);
-    segmented.style.setProperty("--codex-permission-mode-active-index", String(getCodexPermissionModeIndex(current)));
-    for (const mode of CODEX_PERMISSION_MODE_OPTIONS) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.dataset.mode = mode.id;
-      btn.textContent = t(mode.labelKey);
-      btn.classList.toggle("active", current === mode.id);
-      btn.disabled = !!disabled;
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        if (btn.disabled || btn.classList.contains("active")) return;
-        window.settingsAPI.command("setAgentPermissionMode", {
-          agentId: agent.id,
-          mode: mode.id,
-        }).then((result) => {
-          if (!result || result.status !== "ok") {
-            const msg = (result && result.message) || "unknown error";
-            ops.showToast(t("toastSaveFailed") + msg, { error: true });
-          }
-        }).catch((err) => {
+    const control = helpers.buildSegmentedRadio({
+      id: "codex-permission-mode",
+      ariaLabel: t("rowCodexPermissionMode"),
+      className: "codex-permission-mode-segmented",
+      stopPropagation: true,
+      value: readers.readAgentPermissionMode(agent.id),
+      disabled: !!disabled,
+      pending: permissionModePending.has(agent.id),
+      options: CODEX_PERMISSION_MODE_OPTIONS.map((mode) => ({
+        value: mode.id, label: t(mode.labelKey), dataset: { mode: mode.id },
+      })),
+      onValueSync(value, element) {
+        element.style.setProperty("--codex-permission-mode-active-index", String(getCodexPermissionModeIndex(value)));
+      },
+      async onChange(mode) {
+        if (permissionModePending.has(agent.id)) return false;
+        permissionModePending.add(agent.id);
+        try {
+          const result = await window.settingsAPI.command("setAgentPermissionMode", { agentId: agent.id, mode });
+          if (result && result.status === "ok") return true;
+          ops.showToast(t("toastSaveFailed") + ((result && result.message) || "unknown error"), { error: true });
+        } catch (err) {
           ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
-        });
-      });
-      segmented.appendChild(btn);
-    }
-    ctrl.appendChild(segmented);
+        } finally {
+          permissionModePending.delete(agent.id);
+          state.mountedControls.agentPermissionModes.get(agent.id)?.control.setPending(false);
+        }
+        return false;
+      },
+    });
+    ctrl.appendChild(control.element);
     row.appendChild(ctrl);
     state.mountedControls.agentPermissionModes.set(agent.id, {
       row,
+      control,
       agentId: agent.id,
-      syncFromSnapshot: () => syncCodexPermissionModeRow(row, agent.id),
+      syncFromSnapshot() {
+        control.setValue(readers.readAgentPermissionMode(agent.id));
+        control.setDisabled(!readers.readAgentFlagValue(agent.id, "enabled"));
+      },
     });
     return row;
-  }
-
-  function syncCodexPermissionModeRow(row, agentId) {
-    const disabled = !readers.readAgentFlagValue(agentId, "enabled");
-    const current = readers.readAgentPermissionMode(agentId);
-    const segmented = row.querySelector(".codex-permission-mode-segmented");
-    const currentIndex = getCodexPermissionModeIndex(current);
-    const previousActive = segmented && [...segmented.querySelectorAll("button")]
-      .find((btn) => btn.classList.contains("active"));
-    const previousIndex = previousActive
-      ? getCodexPermissionModeIndex(previousActive.dataset.mode)
-      : currentIndex;
-    if (segmented) {
-      segmented.style.setProperty("--codex-permission-mode-active-index", String(previousIndex));
-    }
-    for (const btn of row.querySelectorAll("button")) {
-      btn.classList.toggle("active", btn.dataset.mode === current);
-      btn.disabled = !!disabled;
-    }
-    if (segmented && previousIndex !== currentIndex) {
-      requestAnimationFrame(() => {
-        segmented.getBoundingClientRect();
-        segmented.style.setProperty("--codex-permission-mode-active-index", String(currentIndex));
-      });
-    } else if (segmented) {
-      segmented.style.setProperty("--codex-permission-mode-active-index", String(currentIndex));
-    }
   }
 
   function getCodexPermissionModeIndex(mode) {
@@ -2130,6 +2256,9 @@
         ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
       }).finally(() => {
         syncAgentIntegrationAction(meta);
+        // Install/uninstall rewrites the notices; refresh the DSH row whether
+        // the command succeeded or failed.
+        if (agent.id === "deepseek-harness") refreshMountedDshNotices();
       });
     });
     state.mountedControls.agentIntegrationActions.set(agent.id, meta);
@@ -2205,38 +2334,29 @@
     placeholderKey,
     value,
   }) {
-    const row = document.createElement("div");
-    row.className = "row row-sub agent-text-input-row";
-
-    const text = document.createElement("div");
-    text.className = "row-text";
-    const label = document.createElement("span");
-    label.className = "row-label";
-    label.textContent = t(labelKey);
-    text.appendChild(label);
-    const desc = document.createElement("span");
-    desc.className = "row-desc";
-    desc.textContent = t(descKey);
-    text.appendChild(desc);
-    row.appendChild(text);
-
-    const ctrl = document.createElement("div");
-    ctrl.className = "row-control agent-text-input-control";
-    const input = document.createElement("input");
-    input.type = "text";
-    input.value = typeof value === "function" ? value() : "";
-    input.placeholder = t(placeholderKey);
-    input.spellcheck = false;
-    input.addEventListener("click", (ev) => ev.stopPropagation());
-    input.addEventListener("keydown", (ev) => {
-      ev.stopPropagation();
-      if (ev.key === "Enter") input.blur();
+    const rowParts = helpers.buildSettingRow({
+      labelKey,
+      descriptionKey: descKey,
+      className: "row-sub agent-text-input-row",
+      controlClassName: "agent-text-input-control",
+    });
+    const row = rowParts.element;
+    const ctrl = rowParts.controlElement;
+    const input = helpers.buildTextInput({
+      type: "text",
+      value: typeof value === "function" ? value() : "",
+      placeholder: t(placeholderKey),
+      spellcheck: false,
+      labelledBy: rowParts.labelElement.id,
+      describedBy: rowParts.descriptionElement ? rowParts.descriptionElement.id : null,
+      stopPropagation: true,
+      onEnter: () => input.blur(),
+      onInput: (event) => helpers.setTextInputState(event.currentTarget, { invalid: false }),
     });
     input.addEventListener("change", () => {
       saveAgentTextInput(input, { agentId, command });
     });
     ctrl.appendChild(input);
-    row.appendChild(ctrl);
     row._settingsInput = input;
     row._settingsControl = ctrl;
     return row;
@@ -2248,7 +2368,7 @@
       return { status: "error", message: "settings API unavailable" };
     }
     const nextValue = input.value;
-    input.disabled = true;
+    helpers.setTextInputState(input, { pending: true });
     try {
       const result = await window.settingsAPI.command(command, {
         agentId,
@@ -2256,19 +2376,25 @@
       });
       if (!result || result.status !== "ok") {
         const msg = (result && result.message) || "unknown error";
+        // A pending field is disabled and cannot take focus; clear it first.
+        helpers.setTextInputState(input, { pending: false, invalid: true });
+        input.focus();
         ops.showToast(t("toastSaveFailed") + msg, { error: true });
         return result || { status: "error", message: msg };
       }
+      helpers.setTextInputState(input, { invalid: false });
       ops.showToast(t("toastAgentCustomSaved"));
       if (command === "setAgentCustomDiscoveryPaths" && typeof ops.fetchAgentInstallationHints === "function") {
         await ops.fetchAgentInstallationHints({ force: true });
       }
       return result;
     } catch (err) {
+      helpers.setTextInputState(input, { pending: false, invalid: true });
+      input.focus();
       ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
       return { status: "error", message: err && err.message };
     } finally {
-      input.disabled = false;
+      helpers.setTextInputState(input, { pending: false });
     }
   }
 
@@ -2310,6 +2436,11 @@
     readers = core.readers;
     helpers = core.helpers;
     ops = core.ops;
+    // Startup sync and Doctor repairs write notices while the window is open;
+    // refetching on focus is how those surface without a live push channel.
+    if (typeof window !== "undefined" && window && typeof window.addEventListener === "function") {
+      window.addEventListener("focus", () => refreshMountedDshNotices());
+    }
     core.tabs.agents = {
       render,
       patchInPlace,

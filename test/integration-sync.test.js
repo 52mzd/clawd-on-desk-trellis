@@ -60,6 +60,7 @@ function makeRuntime(overrides = {}) {
     syncWorkBuddyHooksImpl: () => calls.push({ name: "workbuddy" }),
     syncGrokBuildHooksImpl: () => calls.push({ name: "grok-build" }),
     syncKiroHooksImpl: () => calls.push({ name: "kiro" }),
+    syncKiroCrewHooksImpl: () => calls.push({ name: "kirocrew" }),
     syncKimiHooksImpl: () => calls.push({ name: "kimi" }),
     syncQwenHooksImpl: () => calls.push({ name: "qwen" }),
     syncZcodeHooksImpl: () => calls.push({ name: "zcode" }),
@@ -304,6 +305,7 @@ describe("integration sync runtime", () => {
       "workbuddy",
       "grok-build",
       "kiro",
+      "kirocrew",
       "kimi",
       "qwen",
       "zcode",
@@ -324,6 +326,39 @@ describe("integration sync runtime", () => {
     ]);
   });
 
+  it("preheats DSH desktop discovery at startup on Windows without waiting or checking DSH enablement", async () => {
+    const preheatCalls = [];
+    let release;
+    const { runtime } = makeRuntime({
+      platform: "win32",
+      isAgentEnabled: () => false,
+      shouldSyncAgentIntegration: () => false,
+      preheatDshDesktopDiscovery: () => {
+        preheatCalls.push("preheat");
+        return new Promise((resolve) => { release = resolve; });
+      },
+    });
+
+    runtime.syncEnabledStartupIntegrations();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(preheatCalls, ["preheat"]);
+    release();
+  });
+
+  it("does not preheat DSH desktop discovery on non-Windows startup", async () => {
+    const preheatCalls = [];
+    const { runtime } = makeRuntime({
+      platform: "darwin",
+      isAgentEnabled: () => false,
+      shouldSyncAgentIntegration: () => false,
+      preheatDshDesktopDiscovery: () => { preheatCalls.push("preheat"); },
+    });
+
+    runtime.syncEnabledStartupIntegrations();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(preheatCalls, []);
+  });
+
   it("startup sync uses installed-and-enabled intent instead of enabled alone", () => {
     const uninstalled = new Set(["claude-code", "copilot-cli", "pi"]);
     const { runtime, calls } = makeRuntime({
@@ -341,6 +376,7 @@ describe("integration sync runtime", () => {
       "workbuddy",
       "grok-build",
       "kiro",
+      "kirocrew",
       "kimi",
       "qwen",
       "zcode",
@@ -552,6 +588,13 @@ describe("integration sync runtime", () => {
         modulePath: "../hooks/kiro-install.js",
         exportName: "registerKiroHooks",
         reason: "kiro-not-installed",
+      },
+      {
+        agentId: "kirocrew",
+        ctxKey: "syncKiroCrewHooksImpl",
+        modulePath: "../hooks/kirocrew-install.js",
+        exportName: "registerKiroCrewHooks",
+        reason: "kirocrew-not-installed",
       },
       {
         agentId: "kimi-cli",

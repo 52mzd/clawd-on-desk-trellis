@@ -39,6 +39,7 @@ function deriveSourceInfo(host) {
 }
 
 const EVENT_LABEL_KEYS = {
+  PostToolBatch: "eventLabelPostToolBatch",
   SessionStart: "eventLabelSessionStart",
   SessionEnd: "eventLabelSessionEnd",
   UserPromptSubmit: "eventLabelUserPromptSubmit",
@@ -323,6 +324,22 @@ function sessionUpdatedAtComparator(a, b) {
   return String(a.id).localeCompare(String(b.id));
 }
 
+// Desktop apps can reopen a previous conversation on launch and report only a
+// SessionStart before the user touches it. That row is real — the Dashboard
+// still lists and opens it — but it must not reach the HUD until the first
+// action clears the marker.
+//   - DSH desktop reopens the last conversation on launch.
+//   - Kimi Code desktop restores the last viewed conversation on launch, and
+//     opening an old conversation from the sidebar does the same; both only
+//     send a SessionStart.
+const AWAITING_ACTIVITY_AGENTS = new Set(["deepseek-harness", "kimi-cli"]);
+
+function isSessionAwaitingActivity(session) {
+  return !!session
+    && AWAITING_ACTIVITY_AGENTS.has(session.agentId)
+    && session.awaitingActivity === true;
+}
+
 function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {}) {
   const alias = getSessionAliasEntry(id, session, sessionAliases);
   const recentEvents = Array.isArray(session && session.recentEvents)
@@ -340,10 +357,14 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     : () => "";
   const agentId = (session && session.agentId) || null;
   const state = (session && session.state) || "idle";
-  const hiddenFromHud = shouldAutoClearDetachedSession(session, badge, options)
+  // Existing hidden reasons also disable focus (there is nothing to jump to).
+  // The awaiting-activity marker is different: it only hides the HUD row, so the
+  // Dashboard can still list the conversation and open it on demand.
+  const hiddenByExistingReason = shouldAutoClearDetachedSession(session, badge, options)
     || isSupersededLocalCodexProcessSession(id, session, options.latestLocalCodexProcessIds);
+  const hiddenFromHud = hiddenByExistingReason || isSessionAwaitingActivity(session);
   const startupRecovered = !!(session && session.startupRecovered === true);
-  const focusTarget = session && !session.headless && !startupRecovered && state !== "sleeping" && !hiddenFromHud
+  const focusTarget = session && !session.headless && !startupRecovered && state !== "sleeping" && !hiddenByExistingReason
     ? getSessionFocusTarget({ ...(session || {}), id }, {
       osPlatform: options.focusHostPlatform || options.osPlatform,
     })
@@ -413,6 +434,7 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     provider: (session && session.provider) || null,
     codexOriginator: (session && session.codexOriginator) || null,
     codexSource: (session && session.codexSource) || null,
+    dshCarrier: (session && session.dshCarrier) || null,
     contextUsage: snapshotContextUsage(session),
     trellis,
     assistantLastOutput: (session && typeof session.assistantLastOutput === "string")
@@ -453,7 +475,7 @@ function snapshotContextUsage(session) {
   if (Number.isFinite(limit) && limit > 0) out.limit = limit;
   const percent = Number(usage.percent);
   if (Number.isFinite(percent)) out.percent = Math.max(0, Math.min(100, Math.round(percent)));
-  if (usage.source === "claude" || usage.source === "codex" || usage.source === "antigravity" || usage.source === "opencode") out.source = usage.source;
+  if (usage.source === "claude" || usage.source === "codex" || usage.source === "antigravity" || usage.source === "opencode" || usage.source === "workbuddy") out.source = usage.source;
   return out;
 }
 
@@ -653,6 +675,7 @@ function sessionSnapshotSignature(snapshot) {
       provider: entry.provider,
       codexOriginator: entry.codexOriginator,
       codexSource: entry.codexSource,
+      dshCarrier: entry.dshCarrier,
       contextUsage: entry.contextUsage,
       // Trellis binding feeds a HUD badge whose changes must reach renderers
       // even when no other snapshot field moves, so it participates in the
@@ -685,6 +708,8 @@ module.exports = {
   isSessionInProgress,
   deriveSessionBadge,
   shouldAutoClearDetachedSession,
+  AWAITING_ACTIVITY_AGENTS,
+  isSessionAwaitingActivity,
   getSessionAliasEntry,
   getEffectiveSessionTitle,
   sessionDisplayFolder,

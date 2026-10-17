@@ -27,6 +27,7 @@ Windows 的 hit window 在原生 activation controller 可用时按前台全屏�
 - 状态优先级：`error(8) > notification(7) > sweeping(6) > attention(5) > carrying/juggling(4) > working(3) > thinking(2) > idle(1) > sleeping(0)`
 - 最小显示时长：防止快速闪切（`error=5s`、`attention/notification=4s`、`carrying=3s`、`sweeping=2s`、`working/thinking=1s`）
 - 一次性状态：`attention/error/sweeping/notification/carrying` 显示后自动回退（`AUTO_RETURN_MS`）
+- Codex `PreCompact` 为清扫额外建立按对话的显示持有，普通其他对话活动不会提前切回工作；完成或同对话恢复活动后释放，再按完成提示的最小显示时长回退。丢失完成最多持有 10 分钟，headless 不持有，DND/禁用动画/审批锁保持原有语义。
 - 睡眠序列：20s 鼠标静止 → idle-look → 60s → yawning(3s) → dozing → 10min → collapsing(0.8s) → sleeping；鼠标移动触发 waking(1.5s) → 恢复
 - 逻辑 `idle` 与静置视觉分离：Settings 可为当前主题选择一个常驻 idle 变体，但不改变状态优先级；thinking / working / permission / completion / sleep / reaction / roam 仍会覆盖它，结束后再回到所选视觉
 - 逻辑状态与真正显示的视觉也彼此分离：所有 state、reaction、随机 idle、低功耗替换和回退都先生成带 `visualGeneration` 的显示请求；renderer 结算后，main 才提交 `{ displayState, file, hitBox, source, visualGeneration }`。原生 hit window、配饰投影与 Presence 只读这份 committed visual，输入窗口仍即时读取逻辑状态做反应门控
@@ -41,7 +42,7 @@ Windows 的 hit window 在原生 activation controller 可用时按前台全屏�
 Clawd 是主题化桌宠：动画资源、计时、hitbox、眼球追踪参数都来自主题配置。
 
 - 内置主题目录：`themes/clawd/`、`themes/calico/`、`themes/cloudling/`；`themes/template/` 是脚手架模板
-- 官方可下载主题：Clawd 主仓库**不**打包 Hash Sage、Whale-chan 等官方主题的素材；设置页从固定远端 catalog（`https://raw.githubusercontent.com/rullerzhou-afk/clawd-themes/main/catalog-v1.json`）读取主题信息、受限到 `<theme-id>-art.pages.dev/progress/` 的动画展示页，以及一个不超过 1 MiB 的版本化预览图。卡片显示“查看动画”与安装操作，不显示许可摘要或许可链接；完整许可仍保留在 catalog、仓库与主题包中。预览图与主题包都由 Electron main 下载到本地并校验固定 bytes/SHA-256 后才以 `file:` URL 交给 renderer；renderer 不直接加载远程图片。完整主题安装到 `<userData>/themes/<id>/`，并以 **external theme**（`isBuiltin=false`）加载，`trustedRuntime` 不生效。主题包下载/解压只在用户显式点击后发生，首版不做一键更新、backup/rollback 或断点续传。下载用 Electron main `net.request`（继承系统代理/证书，但**不能**像 Codex Pet 那样 pin DNS 结果），因此以「初始 URL 精确 repo/path + 每跳精确 CDN host allowlist + HTTPS/TLS + 无凭据 + 固定 bytes/SHA-256 + manual redirect/no-store/no-referrer」收窄请求面；catalog 无权扩展 host allowlist，未支持 host 返回稳定 `DOWNLOAD_HOST_UNSUPPORTED`
+- 官方可下载主题：Clawd 主仓库**不**打包 Hash Sage、Whale-chan 等官方主题的素材；设置页从固定远端 catalog（`https://raw.githubusercontent.com/rullerzhou-afk/clawd-themes/main/catalog-v1.json`）读取主题信息、受限到 `<theme-id>-art.pages.dev/progress/` 的动画展示页，以及一个不超过 1 MiB 的版本化预览图。卡片显示“查看动画”与安装操作，不显示许可摘要或许可链接；完整许可仍保留在 catalog、仓库与主题包中。预览图与主题包都由 Electron main 下载到本地并校验固定 bytes/SHA-256 后才以 `file:` URL 交给 renderer；renderer 不直接加载远程图片。完整主题安装到 `<userData>/themes/<id>/`，并以 **external theme**（`isBuiltin=false`）加载，`trustedRuntime` 不生效。主题包下载/解压只在用户显式点击后发生，首版不做一键更新、backup/rollback 或断点续传。下载用 Electron main `net.request`（继承系统代理/证书，但**不能**像 Codex Pet 那样 pin DNS 结果），因此以「初始 URL 精确 repo/path + 每跳精确 CDN host allowlist + HTTPS/TLS + 无凭据 + 固定 bytes/SHA-256 + manual redirect/no-store/no-referrer」收窄请求面；catalog 无权扩展 host allowlist，未支持 host 返回稳定 `DOWNLOAD_HOST_UNSUPPORTED`。主仓库另附带一份目录快照 `src/official-theme-catalog-snapshot.json`（打包进安装包）。回落规则：网络拉取失败时，列表先用上一次成功加载的目录（内存 LKG 或磁盘缓存），都没有才用快照；第一次拉取有结果之前（`uninitialized`）不用快照；快照**不作安装依据**，安装只认经校验的网络/磁盘目录，保证卡片显示的版本和实际安装的版本同源。快照**不含任何主题素材或预览图**，要过 `parseCatalogText` 校验，参与版本不能回退的比较，只读不写盘，界面仍按 `offline` 显示并提供重试
 - 官方主题的 manager 专属目录：下载 `.part` 位于 `<userData>/theme-downloads/official/`，解压 staging 位于 `<userData>/theme-staging/official/`，均不在 `themes/` 下；manager 写入的 `.clawd-official-theme.json` marker 在 staging 内、最终同卷 `rename` 之前写入并复验。启动清理只遍历这两个专属目录的直接子级、只处理严格合法且超过 24 小时的孤儿
 - 主题目录的点号直接子目录（staging/backup/lock 等）永远不是主题：`theme-loader._scanThemesDir`、`theme-metadata.scanMetadata` 与 `_readThemeJson` 的按 id 直接读取用同一个「非点号直接子目录」判定，因此点目录既不会被扫描、也不会被选择或直接读取
 - 主题 mutation 的统一 domain lock：`setThemeSelection`、通用 `removeTheme`、内部 `officialTheme.commitInstall` / `officialTheme.uninstall` 共用 `lockKey = "theme"`；destructive fs 操作前在锁内复检 active/target/lstat/marker。`activateTheme` 在 fade sequencer 完成前就返回，因此卸载 active 主题必须等待 `waitForThemeReloadSettled()`；sequencer 在 runtime 切换后同步抛错时走无淡入淡出 fallback 并返回成功
@@ -53,6 +54,7 @@ Clawd 是主题化桌宠：动画资源、计时、hitbox、眼球追踪参数�
 - 若 `sleepSequence.mode` 为 `full`（默认），需提供 `yawning / dozing / collapsing / waking`；`direct` 可直接进入 `sleeping`
 - 若 `miniMode.supported` 为 true，需提供 8 个基础 mini 状态；`mini-working`、`mini-peek-hold`、`mini-sleep-peek` 是可选增强，缺失时优雅降级
 - 能力缺失时走 `VISUAL_FALLBACK_STATES` 回退链
+- `thinking` / `working` / `juggling` 的视觉在每个 hook 事件都会经 `getSvgOverride` 重新解析。`states.thinking`、无 `workingTiers` 时的 `states.working`、无 `jugglingTiers` 时的 `states.juggling`，以及 tier 的 `files` 列出多个文件时随机抽一个；抽中结果由 `state-visual-resolver.js` 的 `createStableVisualPicker` 按状态保持：同一状态、同一候选列表下重复解析返回同一文件（否则每次工具调用都会换动画）。`applyState` 提交新状态时丢弃其他状态的抽签，候选列表变化（tier 随会话数 / 子代理数切换）或 `refreshTheme` 时重抽。tier 的 `files` 优先于 `file`；两者并存时 `file` 只供旧版本读取，并继续作为 Animation Override 的 tier 键。`displayHintMap` 命中时仍然优先
 - 默认配置集中在 `theme-loader.js` 顶部的 `DEFAULT_*` 常量；loader 保持 stateless，`src/theme-runtime.js` 是唯一 active-theme owner，主题 reload/sync/cache 不得另设模块级真相
 - 变体是白名单 deep-merge；数组和特定字段会整体替换
 - Animation override 是用户 per-slot 覆盖，和作者定义的 variants 正交
@@ -73,12 +75,80 @@ Clawd 是主题化桌宠：动画资源、计时、hitbox、眼球追踪参数�
 main 中的 displayed-visual projection 是文件、hitbox 和视觉来源的唯一权威。renderer 对每个仍有效的 request 恰好返回一个终结结果：正常加载为 `swapped`，当前文件已经显示为 `already-displayed`，实际显示了可投影的替代文件为 `fallback`，无法验证则为 `failed`；被后续请求取代的 generation 由 main 标为 `superseded`，renderer 不伪造 ACK。
 
 - renderer 的 object → img → accessory-settle 回退链必须先自行走完；main 的 9750ms settlement deadline 只是无 ACK 兜底
+- 显式 `restartAnimation: true` 请求绕过 renderer 的同文件复用，重播动画并走正常结算；超时重投递保留该标记。Codex 压缩完成用它重播与 `PreCompact` 相同的清扫文件，同时从完成事件重新计入最小显示时间；普通请求继续复用同文件。
 - 同一 logical visual 最多自动 re-request 一次；连续两个 request 都没有 ACK 时，同一 displayed-visual projection 实例最多尝试 reload 一次，失败也消耗预算。当前 main 只创建一个实例，因此该预算覆盖当前主进程寿命，不随 renderer reload 重置；独立 crash recovery 有自己的限制。visual timeout 本身不得循环 reload
 - 只有 `verified: true` 且实际 basename 合法的结果可提交；不可投影的 fallback 以 failed 终结，保留上一份 committed visual
 - reaction 也走 generation 合同，但不广播到 Presence；hit renderer 继续即时消费 logical state，不等待视觉 ACK
 - committed visual 到达后触发原生 hit-window 同步。拖拽锁、窗口未 live 或 Linux sliver 导致的 deferred sync，由 drag release、窗口恢复和现有 transition-end sweep 补做
 
 ## Settings Panel
+
+### Tabs and segmented choices
+
+Settings navigation uses `helpers.buildTabs({ id, ariaLabel | labelledBy, orientation,
+options, value, onChange })`. Options have `value`, `label`, and optional `disabled`;
+`renderLabel(button, option)` adds trusted icons or badges. The result exposes
+`element` (tablist), `panels` (a Map of stable panel shells), `getValue`, `setValue`,
+`setDisabled`, `focus`, and idempotent `dispose`. `setValue` never invokes `onChange`.
+Pages mount only their active panel's content and retain ownership of rendering,
+exit cleanup, drafts, persistence and scrolling. An existing `panels` Map may be
+passed when rebuilding only the sidebar, preserving the mounted page.
+
+Tabs use manual activation: arrows/Home/End move focus; Enter/Space/click activate.
+Horizontal tabs leave Up/Down available for scrolling; the vertical sidebar uses
+Up/Down. Disabled options are skipped. Focus and selection are separate; leaving
+the tablist resets its Tab entry to the selected available option. Each tab has a
+stable `aria-controls`/`aria-labelledby` panel relationship. Sidebar ownership is
+separate from content disposal; Animation Overrides owns its persistent subtab
+controller across local body refreshes and disposes it on full render/exit.
+
+Animation/Sound, Remote Approval and Recap share `helpers.createSubpageHost({
+disposeBody })`. Its `render(panel, renderBody, { scrollTop })` replaces only the
+active body, cleans up outgoing body controls, restores lost keyed focus, and
+preserves the current scroll position unless the page supplies another one.
+Pages dispose the host and their navigation controller on full render/exit;
+global content teardown still owns final mounted-control disposal. Navigation
+must remain outside body disposal. `dispose()` invalidates queued scroll work.
+Tabs offer `onBeforeChange(next, previous)` for capturing outgoing scroll before
+the previous panel is hidden; Animation/Sound uses it for per-subpage positions.
+Remote Approval retains its Channels-to-LAN credential/lookup cleanup.
+
+Recap periods remain radios. A period change captures the requested period and
+fences stale responses, retains the previous chart as inert/busy until new data
+arrives, then commits only the data body. A loading badge appears after 150 ms
+for slow queries; fast queries do not flash a placeholder. Query errors replace
+only the data body with retry UI. Background refreshes likewise leave page chrome
+and recording controls mounted; leaving the page invalidates outstanding queries
+and cancels loading/peek timers. No period preference or response cache is added.
+Recap grids initialize keyboard navigation at the current date/hour (falling back
+to the latest activity), and show a single cell focus ring only for keyboard
+focus. All non-placeholder cells share the same popover for pointer and keyboard
+inspection, including empty/unknown/future coverage states; native title tooltips
+are omitted. Blur, Escape and body disposal dismiss the popover.
+
+Enumerated values use the existing `buildSegmentedRadio`: Codex permission mode,
+Feishu platform and ID type, Recap period, and the General/approval choices. Add a
+stable `id` for focus restoration and an accessible name (`ariaLabel` or
+`labelledBy`). Arrows select immediately. `onChange` may return synchronously or
+asynchronously; false/rejection rolls back unless a newer `setValue` snapshot has
+arrived. `setPending` and `setDisabled` are independent. Pending radios retain
+focus with `aria-disabled` and suppress activation; business-disabled options use
+native disabled. Disposal invalidates asynchronous completions. Pages retain
+cross-render command gates (including Codex permission mode); the primitive does
+not persist settings. `onValueSync(value, element)` can update the Codex pill's CSS
+position alongside checked state, including rollback and snapshot updates.
+
+`requestRender` captures stable focus keys before replacing sidebar or content and
+restores only lost focus after modal rendering. Removed/disabled choices fall back
+to the group's selected available option, then its first enabled option. It must
+not steal focus from an input or dialog opened by the interaction.
+
+The choice inventory test rejects handwritten tabs and segmented controls in
+Settings business modules. Theme Card's existing radio role, Asset Picker's
+listbox selection, and Recap row highlighting are deliberate specialized
+exceptions; they are not part of the segmented contract. Native QA should cover
+keyboard/Accessibility Tree, light/dark, zoom, language, reduced motion, failed
+saves and rerendered focus separately from browser-environment unit tests.
 
 Settings 是独立 `BrowserWindow`，采用 5 层结构：
 

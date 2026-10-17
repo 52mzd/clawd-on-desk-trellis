@@ -86,6 +86,11 @@ describe("built-in accessory capability contracts", () => {
       usages.some((usage) => usage.file === "clawd-idle-reading.svg" && usage.source === "states.waiting"),
       "the waiting-auth display override reuses the reading sprite"
     );
+    assert.ok(!usages.some((usage) => usage.source === "rendering.discreteSampling"));
+    assert.ok(
+      files.includes("clawd-working-thinking.svg"),
+      "a sampled file is also a required asset, like any object-channel file"
+    );
     assert.strictEqual(normalized._capabilities.accessories, true);
     assertDeclaredTargetsExist("clawd", raw);
 

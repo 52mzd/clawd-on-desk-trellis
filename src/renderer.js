@@ -23,9 +23,16 @@ const ACCESSORY_SETTLE_TIMEOUT_MS = visualSwapPolicy.ACCESSORY_SETTLE_TIMEOUT_MS
 const SWAP_VISIBILITY_RESCUE_BUFFER_MS = visualSwapPolicy.SWAP_VISIBILITY_RESCUE_BUFFER_MS || 750;
 const EYE_ATTACH_RETRY_MS = 16;
 const EYE_ATTACH_MAX_ATTEMPTS = 60;
+// A freshly-committed <object> may not expose its contentDocument at the exact
+// load callback; retry sampling on the same bounded cadence as eye attachment.
+const DISCRETE_SAMPLING_RETRY_MS = 16;
+// A synchronous first attempt runs immediately; only its failures schedule
+// retries, so this many retries means at most DISCRETE_SAMPLING_MAX_RETRIES + 1
+// document-ready checks per committed OBJECT.
+const DISCRETE_SAMPLING_MAX_RETRIES = 60;
 const WAKE_OBJECT_RELOAD_RETRIES = 1;
 const LOW_POWER_PAUSE_STYLE_ID = "clawd-low-power-pause-svg";
-const LOW_POWER_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing"]);
+const LOW_POWER_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing", "collapsing", "sleeping"]);
 const LOW_POWER_BOUNDARY_EPSILON_MS = 80;
 const CLOUDLING_POINTER_BRIDGE_STATES = new Set(["idle", "mini-idle", "mini-peek"]);
 const CODEX_PET_VISUAL_BY_FILE = Object.freeze({
@@ -100,6 +107,11 @@ function initWithConfig(cfg) {
   _objectChannelFiles = new Set(
     tc.rendering && Array.isArray(tc.rendering.objectChannelFiles)
       ? tc.rendering.objectChannelFiles
+      : []
+  );
+  _discreteSampling = new Map(
+    tc.rendering && tc.rendering.discreteSampling && typeof tc.rendering.discreteSampling === "object"
+      ? Object.entries(tc.rendering.discreteSampling)
       : []
   );
   _lowPowerStaticImageOverrides = (tc.rendering && tc.rendering.lowPowerStaticImageOverrides) || {};
@@ -502,6 +514,7 @@ let _eyeTrackingStates;
 let _trustedScriptedSvgFiles = new Set();
 let _forceSvgObjectChannel = false;
 let _objectChannelFiles = new Set();
+let _discreteSampling = new Map();
 let _imgCacheBustSeq = 0;
 let _miniViewBox = null;
 let _fileViewBoxes = {};
@@ -1783,6 +1796,7 @@ function normalizeVisualRequest(value) {
     file: value.file,
     source: value.source,
     visualGeneration: value.visualGeneration,
+    ...(value.restartAnimation === true ? { restartAnimation: true } : {}),
   });
 }
 
@@ -1820,6 +1834,82 @@ function settleSuccessfulVisual(request, actualFile, channel, options = {}) {
     channel,
     verified: true,
   });
+}
+
+/**
+ * Give each CSS animation in a document-backed SVG about `rate` sample steps per
+ * second — a full cycle lasting D seconds becomes round(D * rate) steps — by
+ * rewriting its easing to steps() over one duration. Only files
+ * the theme opts into via rendering.discreteSampling are touched, and only on
+ * the <object> channel (an <img> playback exposes no contentDocument). SMIL
+ * animations are not CSS animations and are deliberately out of scope.
+ *
+ * The contentDocument can still be transiently null at the commit point, so the
+ * synchronous first attempt plus at most DISCRETE_SAMPLING_MAX_RETRIES retries
+ * wait for this exact OBJECT element and file. Retries live only while that
+ * element is still the displayed, connected object for the file: a successful
+ * swap changes clawdEl, releasing the element disconnects it, and a failed or
+ * cancelled swap simply leaves the old object in place with its retry intact.
+ * Sampling stays best-effort: if the document never arrives we stop quietly.
+ */
+function applyDiscreteSampling(objectEl, file) {
+  const rate = _discreteSampling.get(file);
+  if (!rate || !objectEl || objectEl.tagName !== "OBJECT") return;
+
+  const trySample = (attempt) => {
+    // Bind the retry to the element that was committed. A newer committed
+    // object, a different displayed file, or a released element silently
+    // retires it; a failed/cancelled swap keeps the same element on screen and
+    // therefore keeps this retry alive.
+    if (clawdEl !== objectEl || currentDisplayedSvg !== file || !objectEl.isConnected) return;
+
+    let contentDocument = null;
+    try {
+      contentDocument = objectEl.contentDocument;
+    } catch {
+      contentDocument = null;
+    }
+    if (!contentDocument || typeof contentDocument.getAnimations !== "function") {
+      if (attempt < DISCRETE_SAMPLING_MAX_RETRIES) {
+        setTimeout(() => trySample(attempt + 1), DISCRETE_SAMPLING_RETRY_MS);
+      } else {
+        console.warn("Timed out waiting for SVG document to apply discrete sampling");
+      }
+      return;
+    }
+
+    let animations = [];
+    try {
+      animations = contentDocument.getAnimations();
+    } catch {
+      return;
+    }
+    for (const animation of animations) {
+      const effect = animation && animation.effect;
+      if (
+        !effect
+        || typeof effect.getComputedTiming !== "function"
+        || typeof effect.updateTiming !== "function"
+      ) {
+        continue;
+      }
+      let timing = null;
+      try {
+        timing = effect.getComputedTiming();
+      } catch {
+        continue;
+      }
+      const durationMs = timing && Number.isFinite(timing.duration) ? timing.duration : NaN;
+      if (!Number.isFinite(durationMs) || durationMs <= 0) continue;
+      try {
+        effect.updateTiming({
+          easing: `steps(${Math.max(1, Math.round((durationMs / 1000) * rate))}, end)`,
+        });
+      } catch {}
+    }
+  };
+
+  trySample(0);
 }
 
 /**
@@ -2066,6 +2156,10 @@ function swapToFile(file, state, useObjectChannel, options = {}) {
       settleSuccessfulVisual(next.__clawdVisualRequest, file, "object", {
         fallback: next.__clawdFallbackFromObject === true,
       });
+      // Fresh document every time (first load, same-file re-entry, system-wake
+      // force reload): each carries its own refreshed animation timeline, so the
+      // cap must be reapplied here rather than once per file.
+      applyDiscreteSampling(next, file);
 
       if (commitState && tracksEyesForFile(commitState, file)) {
         attachEyeTracking(next);
@@ -2294,7 +2388,10 @@ function renderStateFile(requestOrState, legacySvg) {
     cancelPendingSwap("superseded");
   }
 
-  if ((alreadyDisplayed && displayedChannelMatches) || (alreadyPending && pendingChannelMatches)) {
+  // A new cue can intentionally replay the same file (compaction completion
+  // after PreCompact). Give it a fresh timeline and normal settlement ACK.
+  if (!visualRequest?.restartAnimation
+    && ((alreadyDisplayed && displayedChannelMatches) || (alreadyPending && pendingChannelMatches))) {
     // Same file, no swap — but the flip is state-dependent (mini flip vs roam
     // heading), so re-apply it for the incoming state. E.g. a leftward roam
     // entering mini pre-entry reuses the same crabwalk asset; without this the

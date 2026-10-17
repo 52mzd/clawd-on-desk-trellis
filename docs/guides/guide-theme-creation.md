@@ -126,6 +126,8 @@ Do not build a user theme that depends on JavaScript inside SVG files. The built
 
 Ordinary CSS and SMIL animation can run in Chromium's lower-power `<img>` channel, but that channel does not expose `contentDocument` for runtime controls such as reliable pause/resume or document inspection. List a sanitized SVG basename in `rendering.objectChannelFiles` only when that specific asset has been verified to require document-backed behavior; do not list every animated SVG. Listed files become required theme assets and opt the theme into the higher-power scripted rendering profile. This field does not enable JavaScript: external theme SVGs are still sanitized first, including dynamic SMIL attribute values.
 
+The `<object>` channel hands its animation timeline to the compositor, which advances it once per display refresh — needlessly expensive for a background pet on high-refresh displays. When a listed object-channel SVG should animate more coarsely than that, add it to `rendering.discreteSampling` with an integer steps-per-second value between `1` and `60`. Clawd rewrites each of that document's CSS animations to `steps()` over one full cycle, so a 12-second loop at `24` becomes `steps(288, end)`; a short-cycle animation still gets at least one step per cycle, so this is a per-animation sampling cadence rather than a strict document-wide frame-rate ceiling. Declare only assets whose loop still reads correctly under a discrete cadence, and verify each one; `24` is the recommended value. Keys must be SVG basenames that also route through the object channel (or set `rendering.svgChannel` to `"object"`); SMIL animation is not affected.
+
 ## theme.json Reference
 
 ### Required Fields
@@ -258,13 +260,14 @@ The existing schema fields are the only runtime truth. They already act as the t
 | `eyeTracking.enabled` | Global eye-tracking on/off switch. When `false`, states do not need SVG just for cursor tracking. |
 | `eyeTracking.states` | Per-state whitelist for eye tracking. Only listed states must be SVG and will use the object channel. |
 | `rendering.objectChannelFiles` | Optional SVG basename list for files that specifically require document-backed runtime control. Listed files are required assets; external SVGs remain sanitized. |
+| `rendering.discreteSampling` | Optional map from an object-channel SVG basename to an integer steps-per-second value (`1`–`60`). Rewrites each of that document's CSS animations to `steps()` over one full cycle (a 12-second loop at `24` → `steps(288, end)`); a short-cycle animation still gets at least one step per cycle, so it is a per-animation sampling cadence, not a strict frame-rate ceiling. Verify each asset. SMIL animation is unaffected. Recommended value: `24`. |
 | `miniMode.supported` | Enables mini mode for this theme. When `false`, Mini Mode is gated off in the menu/tray and edge-snap path. |
 | `idleAnimations` | Optional idle random pool. Omit or leave empty to keep idle on `states.idle[0]`. |
 | `idleVisualOptions` | Optional selectable-only files for the Default idle visual picker. These files do not enter either idle random pool. |
 | `idleEasterEggs` | Optional conditional idle pool. Each entry runs only for an exact selected head + mouth accessory pair and is subject to its own probability and cooldown. |
 | `reactions` | Optional click/drag reaction block. Omit it to disable click and drag reactions entirely. |
-| `workingTiers` | Optional multi-session working overrides. Omit to fall back to `states.working[0]`. |
-| `jugglingTiers` | Optional subagent juggling overrides. Its legacy `minSessions` / `maxSessions` fields count live subagents, not top-level sessions. Omit to fall back to `states.juggling[0]` if you provide that state. |
+| `workingTiers` | Optional multi-session working overrides. Omit to fall back to `states.working`. A tier may list several `files` to pick from (see Working Tiers). |
+| `jugglingTiers` | Optional subagent juggling overrides. Its legacy `minSessions` / `maxSessions` fields count live subagents, not top-level sessions. Omit to fall back to `states.juggling` if you provide that state. |
 | `customization.petTint` | Opts the theme into the app's built-in pet color filters. Omit it or set it to `false` when filters distort authored colors. Themes cannot provide custom CSS filter strings. |
 | `customization.accessories` | Opts the theme into Clawd's built-in **head** accessory catalog only when every reachable visual has a deterministic attachment or an explicit hidden policy. Exact `files` entries may also prepare optional assets exposed by the animation-override picker; those files become required theme assets. |
 | `customization.mouthAccessories` | Independently opts the theme into the built-in mouth accessory catalog under the same complete-coverage rule, including optional picker assets declared by exact `files` entries. Omit it for head-only themes. |
@@ -352,7 +355,7 @@ State bindings accept the legacy array form, or an object with `files` and optio
 }
 ```
 
-- `files` — the state's own assets
+- `files` — the state's own assets (Working Tiers explains how `thinking`, `working` and `juggling` pick among several files)
 - `fallbackTo` — visual-only fallback target inside `states`
 - Supported `fallbackTo` source states: `error`, `attention`, `notification`, `sweeping`, `carrying`, `sleeping`
 - Fallback does **not** skip the logical state. Timers, hitboxes, and state transitions still run as the original state.
@@ -383,6 +386,22 @@ Different animations based on how many agent sessions are running concurrently:
 ```
 
 `jugglingTiers` uses the same object shape, but its legacy `minSessions` and `maxSessions` names count live subagents within a session.
+
+A tier can list several files in `files` instead of a single `file`, and Clawd picks one of them at random:
+
+```json
+"workingTiers": [
+  { "minSessions": 2, "files": ["juggling.gif", "conducting.gif"] },
+  { "minSessions": 1, "file": "typing.gif", "files": ["typing.gif", "reading.gif", "debugging.gif"] }
+]
+```
+
+- The same applies to `states.thinking`, to `states.working` when there are no `workingTiers`, and to `states.juggling` when there are no `jugglingTiers`: when they list several files, one is picked at random.
+- A pick holds for as long as the pet stays in that state, so repeated hook events (every tool call) keep the same file. Clawd picks again when the pet enters the state anew (for example thinking → working → thinking), when the tier changes because the session or subagent count crossed a `minSessions` threshold, and after a theme reload.
+- `files` wins over `file`. Keep `file` next to `files` only when the theme must also run on Clawd 1.3.0 or earlier, which reads `file` and ignores `files`; list that file inside `files` too. `validate-theme` warns when it is missing from `files`.
+- Every file in `files` is a required asset, and accessory attachments must cover it like any other visual.
+- A matching `displayHintMap` entry still wins over the pool.
+- Settings → Animation Overrides shows one card per tier with the first file of its pool. Replacing it swaps that first file and keeps the rest of the pool, as it does for a state with several files.
 
 ### Reactions
 

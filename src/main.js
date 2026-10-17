@@ -92,6 +92,9 @@ const { registerSettingsIpc } = require("./settings-ipc");
 const { registerTrellisIpc } = require("./trellis-ipc");
 const { augmentedCliPath } = require("./trellis-cli");
 const { scanRoots: scanTrellisRoots } = require("./trellis-scanner");
+const { registerQuotaNotificationIpc } = require("./quota-notification-ipc");
+const { createQuotaAlertsRuntime } = require("./quota-alerts-runtime");
+const { createQuotaNotificationPresenter } = require("./quota-notifications");
 const createSettingsEffectRouter = require("./settings-effect-router");
 const { createRecapRuntime } = require("./recap-runtime");
 const { computeTrellisDailyCounts } = require("./recap-trellis");
@@ -203,7 +206,7 @@ const {
   getFocusableLocalHudSessionIds: selectFocusableLocalHudSessionIds,
   getSessionFocusTarget,
 } = require("./session-focus");
-const { focusCodexThreadTarget } = require("./session-focus-handoff");
+const { focusCodexThreadTarget, focusDshDesktopTarget } = require("./session-focus-handoff");
 const { isSessionInProgress } = require("./state-session-snapshot");
 const { restoreSessionsFromRecoveryLeases } = require("./session-recovery-loader");
 const { createSessionHistoryRuntime } = require("./session-history-runtime");
@@ -248,6 +251,18 @@ const _hitWindowActivationRuntime = createHitWindowActivationRuntime({
   isWin,
   getHitWindow: () => hitWin,
   onError: (err) => console.warn("Clawd: win-hit-window-activation failed:", err && err.message),
+});
+
+// ── Linux/X11: keep the output-only pet render window out of WM focus ──
+// Best-effort; a no-op off the X11 backend or without koffi/libxcb. Chromium
+// writes its resolved Ozone backend back onto the command line, so the switch
+// reads "x11" under the XWayland relaunch and on an Xorg session alike, and
+// "wayland" on native Wayland, where there is no X11 window to hint.
+const { createLinuxX11InputHint } = require("./linux-x11-input-hint");
+const _linuxX11InputHint = createLinuxX11InputHint({
+  isLinuxX11: isLinux && app.commandLine.getSwitchValue("ozone-platform") === "x11",
+  displayName: app.commandLine.getSwitchValue("display"),
+  onError: (err) => console.warn("Clawd: linux-x11-input-hint failed:", err && err.message),
 });
 
 // ── Windows: DWM cloak inspection + un-cloak (#525 self-heal) ──
@@ -585,6 +600,12 @@ const _settingsController = createSettingsController({
     getFeishuApprovalStatus: () => getFeishuApprovalStatus(),
     getFeishuApprovalSecretInfo: () => getFeishuApprovalSecretInfo(),
     sendFeishuApprovalTest: (persisted) => sendFeishuApprovalTest(persisted),
+    regenerateMobileToken: () => ensureMobilePreviewServer().regenerateToken(),
+    resetMobileAccess: () => ensureMobilePreviewServer().resetMobileAccess(),
+    disconnectMobilePreviewClients: () => ensureMobilePreviewServer().disconnectClients({
+      code: 4001,
+      reason: "Permission preview consent changed",
+    }),
     writeSlackNotifySecrets: (secrets) => writeSlackNotifySecrets(secrets),
     getSlackNotifyStatus: () => getSlackNotifyStatus(),
     getSlackNotifySecretInfo: () => getSlackNotifySecretInfo(),
@@ -1327,6 +1348,7 @@ function getEffectiveCurrentPixelSize(overrideWa) {
 }
 let contextMenu;
 let doNotDisturb = false;
+let quotaAlertsRuntime = null;
 let isQuitting = false;
 let quitCleanupStarted = false;
 let appQuitDrainStarted = false;
@@ -1557,6 +1579,7 @@ function requestDisplayedVisual(displayState, file, options = {}) {
     file: visualFile,
     hitBox: _state.resolveHitBoxForSvg(file),
     source: options.source || inferVisualSource(displayState, file),
+    restartAnimation: options.restartAnimation === true,
     deliver: options.deliver || ((payload) => sendRawToRenderer("state-change", payload)),
     onLogicalSettlement: options.onLogicalSettlement,
   });
@@ -2098,6 +2121,7 @@ const _permCtx = {
     _runtimeAgentGate.isAgentPermissionsEnabled(agentId),
   isAgentSubagentPermissionsEnabled: (agentId) =>
     _runtimeAgentGate.isAgentSubagentPermissionsEnabled(agentId),
+  getCodexPermissionMode: () => _runtimeAgentGate.getCodexPermissionMode(),
   isCodexPermissionInterceptEnabled: () =>
     _runtimeAgentGate.isCodexPermissionInterceptEnabled(),
   // The permission layer consumes one normalized runtime mode. DND,
@@ -2179,7 +2203,7 @@ const _permCtx = {
 };
 const _perm = initPermission(_permCtx);
 permissionPresentationRuntime = _perm;
-const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, isPermissionEntryLive, canAutoResolvePendingPermission, beginSessionTrustConfirmation, endSessionTrustConfirmation, syncPermissionBubbleContent, maybeStartRemoteApproval, clearCodexNotifyBubbles, showCodexUserInputBubble, clearCodexUserInputBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodeFamilyPermission, dismissOpencodeFamilyPermissionResolvedExternally } = _perm;
+const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, isPermissionEntryLive, canAutoResolvePendingPermission, wouldAutoAllowPermission, beginSessionTrustConfirmation, endSessionTrustConfirmation, syncPermissionBubbleContent, maybeStartRemoteApproval, clearCodexNotifyBubbles, showCodexUserInputBubble, clearCodexUserInputBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodeFamilyPermission, dismissOpencodeFamilyPermissionResolvedExternally } = _perm;
 const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
@@ -2415,6 +2439,7 @@ const _stateCtx = {
   buildTrayMenu: () => buildTrayMenu(),
   debugLog: (msg) => sessionLog(msg),
   broadcastSessionSnapshot: (snapshot) => {
+    quotaAlertsRuntime?.observeQuota();
     reconcilePowerSaveBlocker();
     broadcastDashboardSessionSnapshot(snapshot);
     broadcastSessionHudSnapshot(snapshot);
@@ -2761,10 +2786,21 @@ _settingsController.subscribeKey("agents", (_agents, snapshot) => {
   }
 });
 const { setState, applyState, updateSession, resolveDisplayState, getSvgOverride,
-        enableDoNotDisturb, disableDoNotDisturb, startStaleCleanup, stopStaleCleanup,
+        enableDoNotDisturb, disableDoNotDisturb: disableDoNotDisturbState,
+        startStaleCleanup, stopStaleCleanup,
         startWakePoll, stopWakePoll, detectRunningAgentProcesses,
         startStartupRecovery: _startStartupRecovery } = _state;
 const sessions = _state.sessions;
+
+function disableDoNotDisturb() {
+  const result = disableDoNotDisturbState();
+  quotaAlertsRuntime?.observeQuota();
+  return result;
+}
+
+function showQuotaAlert(event) {
+  return quotaNotifications.show(event);
+}
 
 async function showSessionAutomationWarning(entry) {
   const parent = selectSessionAutomationDialogParent({
@@ -2919,6 +2955,8 @@ function focusTerminalSession(session, sessionId, requestSource) {
     tmuxSocket: session.tmuxSocket,
     tmuxClient: session.tmuxClient,
     orcaPaneKey: session.orcaPaneKey,
+    herdrPaneId: session.herdrPaneId,
+    herdrSocket: session.herdrSocket,
     ghosttyTerminalId: session.ghosttyTerminalId,
     sessionId: String(sessionId),
     agentId: session.agentId,
@@ -2950,6 +2988,18 @@ function focusDashboardSession(sessionId, options = {}) {
       url: focusTarget.url,
       focusLog,
       focusTerminalSession,
+    });
+    return true;
+  }
+
+  if (focusTarget.type === "dsh-desktop" && focusTarget.url) {
+    focusDshDesktopTarget({
+      shell,
+      focusEntry,
+      sessionId: id,
+      requestSource,
+      url: focusTarget.url,
+      focusLog,
     });
     return true;
   }
@@ -3245,10 +3295,12 @@ const _serverCtx = {
   isAgentPermissionsEnabled: (agentId) => _runtimeAgentGate.isAgentPermissionsEnabled(agentId),
   isAgentSubagentPermissionsEnabled: (agentId) => _runtimeAgentGate.isAgentSubagentPermissionsEnabled(agentId),
   isCodexNativeNotificationSoundEnabled: () => _runtimeAgentGate.isCodexNativeNotificationSoundEnabled(),
+  getCodexPermissionMode: () => _runtimeAgentGate.getCodexPermissionMode(),
   isCodexPermissionInterceptEnabled: () => _runtimeAgentGate.isCodexPermissionInterceptEnabled(),
   codexSubagentClassifier: agentRuntime.getCodexSubagentClassifier(),
   setState,
   updateSession: agentRuntime.updateSessionFromServer,
+  observeClaudeToolPhase: _state.observeClaudeToolPhase,
   updateSessionMetadata: agentRuntime.updateSessionMetadataFromServer,
   shouldSuppressCodexArchive: (rawSessionId, opts) =>
     agentRuntime.shouldSuppressCodexArchive(rawSessionId, opts),
@@ -3261,11 +3313,13 @@ const _serverCtx = {
   removePendingPermission,
   isPermissionEntryLive,
   canAutoResolvePendingPermission,
+  wouldAutoAllowPermission,
   maybeAutoResolveSessionPermission: (entry, options) =>
     !!(sessionAutomationCoordinator
       && sessionAutomationCoordinator.resolveIfAllowed(entry, options)),
   showPermissionBubble,
   showCodexUserInputBubble,
+  syncPermissionBubbleContent,
   clearCodexUserInputBubbles,
   handleTestResult: (result, context) => handleTestResult(result, context),
   maybeStartRemoteApproval,
@@ -3297,13 +3351,75 @@ const { startHttpServer, getHookServerPort } = _server;
 
 // ── LAN WebSocket bridge for PWA mobile clients (lazy-loaded) ──
 let _lanWss = null;
-if (_settingsController.get("mobilePreviewEnabled") === true) {
+let _mobilePreviewReconcileRevision = 0;
+let _mobilePreviewReconcileTail = Promise.resolve();
+
+function setMobilePermissionObservationEnabled(enabled) {
+  const observation = _perm && _perm.permissionObservation;
+  if (observation && typeof observation.setEnabled === "function") {
+    observation.setEnabled(enabled === true);
+  }
+}
+
+function ensureMobilePreviewServer() {
+  if (_lanWss) return _lanWss;
   const { initMobilePreviewServer } = require("./network/mobile-preview-server");
   _lanWss = initMobilePreviewServer({
     sessions,
-    getSettingsSnapshot: () => _settingsController.getSnapshot(),
-    isEnabled: () => _settingsController.get("mobilePreviewEnabled") === true,
+    permissionObservation: _perm && _perm.permissionObservation,
+    log: (message) => sessionLog(message),
   });
+  return _lanWss;
+}
+
+function enqueueMobilePreviewReconcile(snapshot = _settingsController.getSnapshot()) {
+  const desired = {
+    revision: ++_mobilePreviewReconcileRevision,
+    sessionEnabled: snapshot && snapshot.mobilePreviewEnabled === true,
+    permissionEnabled: !!(
+      snapshot
+      && snapshot.mobilePreviewEnabled === true
+      && snapshot.mobilePermissionPreviewEnabled === true
+    ),
+  };
+
+  _mobilePreviewReconcileTail = _mobilePreviewReconcileTail
+    .catch((err) => {
+      console.warn("Clawd: prior mobile preview reconcile failed:", err && err.message);
+    })
+    .then(async () => {
+      if (desired.revision !== _mobilePreviewReconcileRevision) return;
+      if (!desired.sessionEnabled) {
+        setMobilePermissionObservationEnabled(false);
+        if (_lanWss) await _lanWss.cleanup();
+        return;
+      }
+
+      const server = ensureMobilePreviewServer();
+      if (desired.revision !== _mobilePreviewReconcileRevision) return;
+      setMobilePermissionObservationEnabled(desired.permissionEnabled);
+      await startMobilePreviewServerSafely(server, {
+        source: "settings-reconcile",
+        onError: (err) => console.warn(
+          "Clawd mobile preview: start failed:",
+          err && err.message ? err.message : err,
+        ),
+      });
+
+      // A newer disable may have committed while listen() was in flight.
+      // Never leave that stale listener alive while the queued successor waits.
+      if (desired.revision !== _mobilePreviewReconcileRevision) {
+        const latest = _settingsController.getSnapshot();
+        if (!latest || latest.mobilePreviewEnabled !== true) await server.cleanup();
+      }
+    })
+    .catch((err) => {
+      console.warn("Clawd: mobile preview reconcile failed:", err && err.message);
+    });
+
+  // Synchronous facade: settings-effect-router must never receive a rejecting
+  // Promise because safeCall only contains synchronous throws.
+  return undefined;
 }
 
 function updateLog(msg) {
@@ -4988,6 +5104,8 @@ const settingsEffectRouter = createSettingsEffectRouter({
   refreshDisplayedVisual: refreshDisplayedVisualForLowPowerMode,
   rebuildAllMenus,
   reconcilePowerSaveBlocker,
+  disableMobilePermissionObservation: () => setMobilePermissionObservationEnabled(false),
+  enqueueMobilePreviewReconcile,
   setRecapEnabled: (enabled) => recapRuntime.setEnabled(enabled),
   logWarn: console.warn,
 });
@@ -5065,28 +5183,6 @@ _settingsController.subscribeKey("feishuApproval", () => {
 _settingsController.subscribeKey("slackNotify", () => {
   broadcastSlackNotifyStatus();
 });
-_settingsController.subscribeKey("mobilePreviewEnabled", (enabled) => {
-  if (enabled) {
-    if (!_lanWss) {
-      const { initMobilePreviewServer } = require("./network/mobile-preview-server");
-      _lanWss = initMobilePreviewServer({
-        sessions,
-        getSettingsSnapshot: () => _settingsController.getSnapshot(),
-        isEnabled: () => _settingsController.get("mobilePreviewEnabled") === true,
-      });
-    }
-    void startMobilePreviewServerSafely(_lanWss, {
-      source: "settings-enable",
-      onError: (err) => console.warn(
-        "Clawd mobile preview: settings start failed:",
-        err && err.message ? err.message : err,
-      ),
-    });
-  } else if (_lanWss) {
-    _lanWss.cleanup();
-  }
-});
-
 animationOverridesMain = createSettingsAnimationOverridesMain({
   app,
   BrowserWindow,
@@ -5257,6 +5353,22 @@ const settingsSizePreviewSession = createSettingsSizePreviewSession({
     }
     return _settingsController.applyCommand("resizePet", sizeKey);
   },
+});
+
+const quotaNotifications = createQuotaNotificationPresenter({
+  Notification, platform: process.platform, trayBalloonOwner, getTray: () => _menu.getTray(),
+  isSuppressed: () => doNotDisturb || isQuitting || !app.isReady(),
+  isMuted: () => soundMuted, getLang: () => lang, openSettings: () => settingsWindowRuntime.open(),
+});
+const quotaNotificationIpc = registerQuotaNotificationIpc({
+  ipcMain, settingsController: _settingsController, getSettingsWindow,
+  testNotification: () => quotaNotifications.test(),
+});
+quotaAlertsRuntime = createQuotaAlertsRuntime({
+  settingsController: _settingsController, state: _state,
+  getDoNotDisturb: () => doNotDisturb, notifyQuota: showQuotaAlert,
+  historyPath: path.join(app.getPath("userData"), "quota-alert-history.json"),
+  powerMonitor, logWarn: (message) => console.warn(message),
 });
 
 const settingsIpcRuntime = registerSettingsIpc({
@@ -5575,6 +5687,7 @@ function createWindow() {
     setRenderWindow: (createdWindow) => { win = createdWindow; },
     isQuitting: () => isQuitting,
     applyDockVisibility,
+    applyNoInputHint: (createdWindow) => _linuxX11InputHint.applyNoInputHint(createdWindow),
   });
   finalizePetAccessorySlotsDelivery(initialAccessoryDelivery, true);
 
@@ -5741,15 +5854,7 @@ function createWindow() {
       console.warn("Clawd remote-ssh: connect-on-launch failed:", err && err.message);
     });
   }).catch(() => {});
-  if (_settingsController.get("mobilePreviewEnabled") === true) {
-    void startMobilePreviewServerSafely(_lanWss, {
-      source: "app-startup",
-      onError: (err) => console.warn(
-        "Clawd mobile preview: startup failed:",
-        err && err.message ? err.message : err,
-      ),
-    });
-  }
+  enqueueMobilePreviewReconcile(_settingsController.getSnapshot());
   startStaleCleanup();
   // Wait for renderer to be ready before sending initial state
   // If hooks arrived during startup, respect them instead of forcing idle
@@ -5955,6 +6060,8 @@ const { enterMiniMode, exitMiniMode, enterMiniViaMenu, miniPeekIn, miniPeekOut,
 
 // ── Free Roam — initialized here after state and mini modules ──
 const _roamCtx = {
+  hasActiveSessions: anySessionInProgress,
+  resolveDisplayState,
   get win() { return win; },
   get dragLocked() { return petWindowRuntime.isDragLocked(); },
   getPetWindowBounds,
@@ -5973,6 +6080,11 @@ const _roamCtx = {
   clampToScreenVisual,
   getMiniMode: () => _mini.getMiniMode(),
   getCurrentState: () => _state.getCurrentState(),
+  getUnattendedMs: () => {
+    const mouseStillSince = _tick ? _tick._mouseStillSince : Date.now();
+    return Date.now() - mouseStillSince;
+  },
+  getSleepTimeoutMs: () => getActiveTheme().timings.mouseSleepTimeout,
   isSizePreviewActive: () => petWindowRuntime.isSettingsSizePreviewActive(),
   get miniTransitioning() { return _mini.getMiniTransitioning(); },
   applyState: (state, svgOverride, opts) => _state.applyState(state, svgOverride, opts),
@@ -6154,10 +6266,12 @@ if (!gotTheLock) {
     try {
       const tray = _menu && typeof _menu.getTray === "function" ? _menu.getTray() : null;
       if (process.platform === "win32") {
+        const { getCodexHookNudgeKeys } = require("./codex-hook-health");
+        const keys = getCodexHookNudgeKeys(verdict);
         trayBalloonOwner.show(tray, {
           iconType: "warning",
-          title: t("codexHookHealthNudgeTitle"),
-          content: t("codexHookHealthNudgeBody"),
+          title: t(keys.title),
+          content: t(keys.body),
         });
       }
     } catch (err) {
@@ -6354,6 +6468,7 @@ if (!gotTheLock) {
 
     // Register persistent global shortcuts from the validated prefs snapshot.
     shortcutRuntime.registerPersistentShortcutsFromSettings();
+    quotaAlertsRuntime.start();
 
     // Construct log monitors. We always instantiate them so toggling the
     // agent on/off later can call start()/stop() without paying the require
@@ -6383,6 +6498,7 @@ if (!gotTheLock) {
   });
 
   app.on("before-quit", (event) => {
+    quotaNotificationIpc.dispose();
     isQuitting = true;
     if (!appQuitDrainReady) {
       event.preventDefault();
@@ -6397,6 +6513,8 @@ if (!gotTheLock) {
     }
     if (quitCleanupStarted) return;
     quitCleanupStarted = true;
+    quotaAlertsRuntime?.dispose();
+    quotaNotifications.dispose();
     // Cancel any live official-theme download and drop this round's `.part`.
     if (officialThemeMain) {
       try { officialThemeMain.cancelInstall(); } catch {}

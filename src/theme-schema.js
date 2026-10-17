@@ -209,6 +209,41 @@ function validateTheme(cfg) {
       ) {
         errors.push("rendering.objectChannelFiles must contain SVG basenames only");
       }
+      if (cfg.rendering.discreteSampling !== undefined) {
+        // Discrete sampling only rewrites CSS animation timing on the
+        // document-backed (<object>) channel, so it cannot change the derived
+        // power profile and must not be folded into hasScriptedSvgRuntime:
+        // declaring a rate alone must never opt a theme into the scripted
+        // profile. Each entry describes a file that already routes through
+        // <object>; a key that never reaches that channel would be a silent
+        // no-op, so it is rejected instead of accepted as a typo.
+        const sampling = cfg.rendering.discreteSampling;
+        if (!isPlainObject(sampling)) {
+          errors.push("rendering.discreteSampling must be an object mapping SVG basenames to a sample rate");
+        } else {
+          const objectChannelFiles = Array.isArray(cfg.rendering.objectChannelFiles)
+            ? cfg.rendering.objectChannelFiles.filter((file) => (
+              typeof file === "string"
+              && basenameOnly(file) === file
+              && file.endsWith(".svg")
+            ))
+            : [];
+          const forceObjectChannel = cfg.rendering.svgChannel === "object";
+          for (const [file, rate] of Object.entries(sampling)) {
+            if (typeof file !== "string" || basenameOnly(file) !== file || !file.endsWith(".svg")) {
+              errors.push(`rendering.discreteSampling keys must contain SVG basenames only, got ${JSON.stringify(file)}`);
+              continue;
+            }
+            if (!Number.isInteger(rate) || rate < 1 || rate > 60) {
+              errors.push(`rendering.discreteSampling["${file}"] must be an integer between 1 and 60, got ${JSON.stringify(rate)}`);
+              continue;
+            }
+            if (!forceObjectChannel && !objectChannelFiles.includes(file)) {
+              errors.push(`rendering.discreteSampling["${file}"] must also be listed in rendering.objectChannelFiles (or set rendering.svgChannel to "object")`);
+            }
+          }
+        }
+      }
     }
   }
 
@@ -253,6 +288,8 @@ function validateTheme(cfg) {
   if (cfg.mirroredFiles !== undefined) {
     errors.push(...validateMirroredFiles(cfg.mirroredFiles));
   }
+
+  errors.push(...validateTierFiles(cfg));
 
   const fallbackStateKeys = Object.keys(normalizedStates);
   for (const stateKey of fallbackStateKeys) {
@@ -468,6 +505,45 @@ function hasStateBinding(entry) {
   return normalized.files.length > 0 || !!normalized.fallbackTo;
 }
 
+// A working/juggling tier names its visual with `file` (one visual) and/or
+// `files` (a pool the runtime draws from). `files` wins when it is present;
+// a theme may keep `file` next to it for Clawd builds that only read `file`.
+function getTierFiles(tier) {
+  if (!isPlainObject(tier)) return [];
+  if (Array.isArray(tier.files)) {
+    const files = tier.files.filter((file) => typeof file === "string" && file);
+    if (files.length > 0) return files;
+  }
+  return typeof tier.file === "string" && tier.file ? [tier.file] : [];
+}
+
+// Stable identity of a tier for per-tier user overrides. `file` stays the key
+// when both fields are declared, so adding `files` to an existing tier keeps
+// the overrides users already saved against it.
+function getTierKeyFile(tier) {
+  if (isPlainObject(tier) && typeof tier.file === "string" && tier.file) return tier.file;
+  return getTierFiles(tier)[0] || null;
+}
+
+function validateTierFiles(cfg) {
+  const errors = [];
+  for (const groupName of ["workingTiers", "jugglingTiers"]) {
+    const group = cfg && cfg[groupName];
+    if (!Array.isArray(group)) continue;
+    group.forEach((tier, index) => {
+      if (!isPlainObject(tier) || tier.files === undefined) return;
+      if (
+        !Array.isArray(tier.files)
+        || tier.files.length === 0
+        || tier.files.some((file) => typeof file !== "string" || !file)
+      ) {
+        errors.push(`${groupName}[${index}].files must be a non-empty array of file names when present`);
+      }
+    });
+  }
+  return errors;
+}
+
 function normalizeStateBindings(states) {
   const normalized = {};
   if (!isPlainObject(states)) return normalized;
@@ -585,6 +661,14 @@ function projectThemeVisualUsages(cfg) {
   for (const [groupName, group] of [
     ["workingTiers", cfg && cfg.workingTiers],
     ["jugglingTiers", cfg && cfg.jugglingTiers],
+  ]) {
+    for (const tier of Array.isArray(group) ? group : []) {
+      for (const file of getTierFiles(tier)) {
+        addVisualUsage(usages, `normal:${groupName}`, file, groupName);
+      }
+    }
+  }
+  for (const [groupName, group] of [
     ["idleAnimations", cfg && cfg.idleAnimations],
     ["idleVisualOptions", cfg && cfg.idleVisualOptions],
     ["idleEasterEggs", cfg && cfg.idleEasterEggs],
@@ -1314,6 +1398,14 @@ function collectRequiredAssetFiles(theme) {
   for (const file of Array.isArray(objectChannelFiles) ? objectChannelFiles : []) {
     addThemeAssetFile(files, file);
   }
+  // Discrete sampling names the same document-backed assets again; treat the
+  // basenames as required too so a typo fails asset validation instead of
+  // silently sampling nothing. (The schema rejects keys outside the object
+  // channel, but a forced svgChannel leaves objectChannelFiles empty.)
+  const discreteSampling = theme && theme.rendering && theme.rendering.discreteSampling;
+  for (const file of Object.keys(isPlainObject(discreteSampling) ? discreteSampling : {})) {
+    addThemeAssetFile(files, file);
+  }
   const mirroredFiles = theme && theme.mirroredFiles;
   for (const file of Object.values(isPlainObject(mirroredFiles) ? mirroredFiles : {})) {
     addThemeAssetFile(files, file);
@@ -1414,6 +1506,15 @@ function normalizeRendering(value) {
     seenObjectChannelFiles.add(safeFile);
     objectChannelFiles.push(safeFile);
   }
+  const discreteSampling = {};
+  if (isPlainObject(value.discreteSampling)) {
+    for (const [rawFile, rate] of Object.entries(value.discreteSampling)) {
+      const safeFile = basenameOnly(rawFile);
+      if (!safeFile || !safeFile.endsWith(".svg")) continue;
+      if (!Number.isInteger(rate) || rate < 1 || rate > 60) continue;
+      discreteSampling[safeFile] = rate;
+    }
+  }
   if (isPlainObject(value.lowPowerStaticImageOverrides)) {
     for (const [state, override] of Object.entries(value.lowPowerStaticImageOverrides)) {
       if (!isPlainObject(override)) continue;
@@ -1430,6 +1531,7 @@ function normalizeRendering(value) {
     rendering.lowPowerStaticImageOverrides = lowPowerStaticImageOverrides;
   }
   if (objectChannelFiles.length > 0) rendering.objectChannelFiles = objectChannelFiles;
+  if (Object.keys(discreteSampling).length > 0) rendering.discreteSampling = discreteSampling;
   return {
     ...rendering,
   };
@@ -1691,10 +1793,16 @@ function mergeDefaults(raw, themeId, isBuiltin) {
     for (const [k, v] of Object.entries(theme.completionVisualMap)) theme.completionVisualMap[k] = bn(v);
   }
   if (theme.workingTiers) {
-    for (const t of theme.workingTiers) { if (t.file) t.file = bn(t.file); }
+    for (const t of theme.workingTiers) {
+      if (t.file) t.file = bn(t.file);
+      if (Array.isArray(t.files)) t.files = t.files.map(bn);
+    }
   }
   if (theme.jugglingTiers) {
-    for (const t of theme.jugglingTiers) { if (t.file) t.file = bn(t.file); }
+    for (const t of theme.jugglingTiers) {
+      if (t.file) t.file = bn(t.file);
+      if (Array.isArray(t.files)) t.files = t.files.map(bn);
+    }
   }
   if (Array.isArray(theme.idleAnimations)) {
     for (const a of theme.idleAnimations) { if (a && a.file) a.file = bn(a.file); }
@@ -1742,6 +1850,9 @@ module.exports = {
   getStateFiles,
   hasStateFiles,
   hasStateBinding,
+  getTierFiles,
+  getTierKeyFile,
+  validateTierFiles,
   normalizeStateBindings,
   hasReactionBindings,
   supportsIdleTracking,
