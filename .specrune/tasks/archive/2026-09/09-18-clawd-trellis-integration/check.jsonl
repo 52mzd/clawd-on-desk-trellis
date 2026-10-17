@@ -1,0 +1,7 @@
+{"file": ".specrune/tasks/09-18-clawd-trellis-integration/prd.md", "reason": "验收基准：R1-R7 与 Acceptance Criteria 逐条核对，确认无遗漏、无越界实现"}
+{"file": ".specrune/tasks/09-18-clawd-trellis-integration/design.md", "reason": "验收基准：D1-D9 决策与接口契约是否被如实遵守（尤其 D4 版本比较、D5 并发/取消语义、D7 不自动升级、D9 七语言）"}
+{"file": ".specrune/tasks/09-18-clawd-trellis-integration/implement.md", "reason": "验收基准：阶段验证命令是否逐条执行、手工验收清单是否覆盖、回滚点是否有效"}
+{"file": ".specrune/spec/guides/cross-layer-thinking-guide.md", "reason": "检查跨层契约一致性：IPC 返回形状、upgradable 的 null 与 false 语义区分、i18n key parity"}
+{"file": ".specrune/spec/guides/code-reuse-thinking-guide.md", "reason": "检查是否重复造轮子：normalize 是否复用既有 helper、命令执行是否复用既有 env/execFile 包装、是否新造订阅模式"}
+{"file": ".specrune/spec/frontend/quality-guidelines.md", "reason": "代码质量标准与禁止模式检查"}
+{"file": ".specrune/spec/guides/trellis-panel-contract.md", "reason": "验收基准：逐条核对 argv 常量是否分开、两层白名单是否都在、未知值是否 fail-closed 且不 spawn、--version 解析断言是否含横幅反向用例"}

@@ -1,0 +1,85 @@
+{
+  "slug": "specrune-board-architecture",
+  "task": ".specrune/tasks/10-18-dashboard-specrune-board",
+  "agent": "research",
+  "revision": "09a9e9469bdf390a54f2f3ae25ad8421cd4fa020",
+  "created_at": "2026-10-17T19:16:37.832497Z",
+  "context": {
+    "hash": "438021ec8a907bd29ed52f34ee219cea149ca912861ddc209185293389de8b88",
+    "bytes": 110048,
+    "entries": [
+      {
+        "file": ".specrune/spec/frontend/index.md",
+        "reason": "规范包 frontend",
+        "source": "scope",
+        "bytes": 1829
+      },
+      {
+        "file": ".specrune/spec/guides/index.md",
+        "reason": "规范包 guides",
+        "source": "scope",
+        "bytes": 6037
+      },
+      {
+        "file": ".specrune/spec/frontend/directory-structure.md",
+        "reason": "规范包 frontend",
+        "source": "scope",
+        "bytes": 2132
+      },
+      {
+        "file": ".specrune/spec/guides/code-reuse-thinking-guide.md",
+        "reason": "规范包 guides",
+        "source": "scope",
+        "bytes": 8772
+      },
+      {
+        "file": ".specrune/spec/frontend/i18n-guidelines.md",
+        "reason": "规范包 frontend",
+        "source": "scope",
+        "bytes": 2749
+      },
+      {
+        "file": ".specrune/spec/guides/cross-layer-thinking-guide.md",
+        "reason": "规范包 guides",
+        "source": "scope",
+        "bytes": 28288
+      },
+      {
+        "file": ".specrune/spec/frontend/ipc-guidelines.md",
+        "reason": "规范包 frontend",
+        "source": "scope",
+        "bytes": 1973
+      },
+      {
+        "file": ".specrune/spec/guides/fork-release-guide.md",
+        "reason": "规范包 guides",
+        "source": "scope",
+        "bytes": 17242
+      },
+      {
+        "file": ".specrune/spec/frontend/quality-guidelines.md",
+        "reason": "规范包 frontend",
+        "source": "scope",
+        "bytes": 3322
+      },
+      {
+        "file": ".specrune/spec/guides/repository-sync-guide.md",
+        "reason": "规范包 guides",
+        "source": "scope",
+        "bytes": 8094
+      },
+      {
+        "file": ".specrune/spec/frontend/renderer-guidelines.md",
+        "reason": "规范包 frontend",
+        "source": "scope",
+        "bytes": 29395
+      }
+    ],
+    "dropped": [
+      {
+        "file": ".specrune/spec/guides/trellis-panel-contract.md",
+        "reason": "规范包 guides（总预算已耗尽，仅保留索引行）"
+      }
+    ]
+  }
+}

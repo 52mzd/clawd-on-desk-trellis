@@ -1,0 +1,2 @@
+{"file": ".specrune/tasks/10-18-dashboard-specrune-board/research/clawd-dashboard-trellis-architecture.md", "reason": "现有 Trellis 面板架构与全部镜像触点（file:line）"}
+{"file": ".specrune/tasks/10-18-dashboard-specrune-board/research/specrune-data-model.md", "reason": "SpecRune 磁盘数据契约：task.json schema、状态白名单、指针与归档布局"}
