@@ -248,8 +248,6 @@ module.exports = {
   resolveVisualBinding,
   countActiveSessionsByStates,
   countLiveSubagents,
-  normalizeTierExtraCount,
-  selectTieredStateFile,
   selectTieredStateFiles,
   getWorkingSvg,
   getJugglingSvg,

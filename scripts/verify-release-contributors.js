@@ -121,6 +121,11 @@ function verifyReleaseContributors(options = {}) {
     cwd: root,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    // The release window spans every commit since the previous tag, each with
+    // its full body (%B). A long-lived branch (a fork syncing thousands of
+    // upstream commits) blows past the 1 MiB default and fails the release
+    // gate with ENOBUFS, so give git room to say what it actually found.
+    maxBuffer: 64 * 1024 * 1024,
   }));
   const errors = [];
   let tags = [];

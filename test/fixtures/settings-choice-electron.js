@@ -28,7 +28,7 @@ async function main() {
     }
     await run(`
       window.exits = 0;
-      for (const id of ["general", "agents", "theme", "animOverrides", "shortcuts", "telegram-approval", "discord-presence", "remote-ssh", "recap", "about"]) {
+      for (const id of ["general", "agents", "theme", "animOverrides", "shortcuts", "telegram-approval", "discord-presence", "remote-ssh", "recap", "trellis", "about"]) {
         ClawdSettingsCore.tabs[id] = { render(panel) { panel.textContent = id; }, onExit() { exits++; } };
       }
       window.readChoice = () => ({ value: ClawdSettingsCore.state.activeTab, focus: document.activeElement.dataset.value, exits });
@@ -54,7 +54,11 @@ async function main() {
     await win.webContents.debugger.sendCommand("Accessibility.enable");
     const tree = await win.webContents.debugger.sendCommand("Accessibility.getFullAXTree");
     const tabs = tree.nodes.filter((node) => !node.ignored && node.role?.value === "tab");
-    assert.equal(tabs.length, 10);
+    // Derived from the rendered sidebar rather than a literal: the sidebar tab
+    // list is the product surface under test, and pinning a count here just
+    // re-breaks whenever a tab is added.
+    const renderedTabs = await run('document.querySelectorAll("[role=tab]").length');
+    assert.equal(tabs.length, renderedTabs);
     assert.equal(tabs.filter((node) => node.properties.some((prop) => prop.name === "selected" && prop.value.value)).length, 1);
     assert.equal(tree.nodes.filter((node) => !node.ignored && node.role?.value === "tabpanel").length, 1);
     win.webContents.debugger.detach();

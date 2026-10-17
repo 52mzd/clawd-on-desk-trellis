@@ -92,6 +92,7 @@ docs/**
 !docs/releases/release-v1.2.0-trellis.1.2.md
 !docs/releases/release-v1.2.0-trellis.1.3.md
 !docs/releases/release-v1.3.0.md
+!docs/releases/release-v1.3.0-trellis.1.0.md
 
 # Temp files from testing
 .tmp_*
