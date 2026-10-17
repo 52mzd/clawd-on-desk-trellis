@@ -542,10 +542,25 @@ entry.id 直接当外部工具记录 id 用的代码都会静默失配（HUD 徽
   taskPath 前缀必须与解析出的根目录名强匹配（`.trellis/tasks/` 打不开
   `.specrune` 树，反之亦然）。状态映射沿用 trellis 语义外加两条：
   遗留 `done` ≡ `completed`→finish（SpecRune 读兼容）；`canceled` → null
-  不渲染（IsUnboundStatus 同义）。返回体对 `.specrune` 根加
-  `workflow: "specrune"`，trellis 保持旧形状（字段缺省）。别名表新增
+  不渲染（IsUnboundStatus 同义）。别名表新增
   `deepseek-harness → dsh`（真实指针证据：本仓
   `.specrune/.runtime/sessions/dsh_session-*.json`）。
+- **`workflow` 载荷字段（10-18 specrune board，跨层契约）**：`.specrune` 根
+  产出的 IPC 数据在**恰好四处**携带可选字段 `workflow: "specrune"`，trellis
+  根一律**缺省**（旧形状逐字节不变，绝无 `workflow: "trellis"`）：
+  ① snapshot `entry.trellis.workflow`（getTrellisInfo）；
+  ② `readActiveList`/`collectActiveTasksInRoot` 的 task 条目；
+  ③ `readArchiveList` 的 task 条目；
+  ④ `readTaskDetail` 的 `task.workflow`。
+  渲染层消费规则（dashboard-renderer `createTrellisTaskRow` /
+  `buildTrellisSplitRow`）：`task.workflow === "specrune"` 才渲染
+  `.trellis-workflow-badge`（文案键 `dashboardTrellisSpecruneBadge`，7 语言）；
+  聚合层 `aggregateTrellisTasks` 首个非空值透传（同 title 策略）。
+  Wrong：`workflow: "trellis"` 显式回填或按 taskPath 前缀在渲染层嗅探来源
+  ——来源真相只在读取层（根目录名），渲染层嗅探会把逻辑劈成两半。
+  Correct：读取层从 `path.basename(root)` 判定、只增不改载荷形状，渲染层
+  只认字段。测试锚点：test/trellis-specrune-support.test.js（绑定/列表/
+  详情/聚合透传 + CSS·i18n 静态守卫）。
 - **已知 root 窗口 = 注册上限**：`collectKnownRootCwds` 的 cap 必须引用
   `trellis-roots` 的 `TRELLIS_ROOTS_MAX`，不得本地写死——写死 32 时第 33+ 个
   注册项目按注册序被 `slice` 静默截出 readActiveList / readArchiveList /
