@@ -361,6 +361,7 @@ async function loadHud(sessions, openResult = { status: "ok" }, panelResult = nu
     clearTimeout: () => { feedbackTimeout = null; },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "src", "session-focus-unavailable.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "src", "session-hud-tagged-fallback.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "src", "session-hud-renderer.js"), "utf8"), context);
   await flush();
   snapshotListener({ sessions, orderedIds: sessions.map((entry) => entry.id) });
@@ -770,7 +771,18 @@ test("Dashboard keeps session automation failure feedback visible after rerender
   );
 });
 
-test("HUD unfocusable single-click explains why and offers folder only for local non-webui", async () => {
+test("completed temporary chat preference changes HUD rows while Dashboard keeps the same sessions", async () => {
+  const rows = [session("active", { state: "working" }),
+    session("completed-temporary", { badge: "done", hudHiddenByPreference: true })];
+  const hud = await loadHud(rows);
+  assert.strictEqual(byClass(hud.root, "row").length, 1);
+  const dashboard = await loadDashboard(rows);
+  assert.strictEqual(byClass(dashboard.root, "card").length, 2);
+  hud.pushSnapshot(rows.map(row => ({ ...row, hudHiddenByPreference: false })));
+  assert.strictEqual(byClass(hud.root, "row").length, 2);
+});
+
+test("HUD unfocusable click explains why and offers folder only for local non-webui", async () => {
   const { root } = await loadHud([
     session("local"),
     session("remote", { sourceType: "ssh", host: "host" }),

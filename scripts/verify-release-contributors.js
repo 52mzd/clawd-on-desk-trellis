@@ -150,8 +150,14 @@ const IDENTITY_OVERRIDES = new Map(Object.entries({
   "codex@openai.com": null,
   "noreply@google.com": null,
   "user@example.com": null,
-  "sabinabd@amazon.com": null,
+  "sabinabd@amazon.com": "zero-or-one",
   "wenkangqiang.wkq@alibaba-inc.com": null,
+  // ── 上游 v1.5.0 同步补充 ──
+  "2550975@tongji.edu.cn": "tianxingjian2406",
+  "aminorsh@gmail.com": "Aminorsh",
+  "daijx66@gmail.com": "daijx-ai",
+  "sunfleeting@gmail.com": "sunfleeting-debug",
+  "386476500@qq.com": "du-xinyi",
 }));
 
 for (const [email, handle] of [...IDENTITY_OVERRIDES]) {

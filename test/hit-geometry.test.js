@@ -9,10 +9,10 @@ themeLoader.init(path.join(__dirname, "..", "src"));
 const calico = themeLoader.loadTheme("calico");
 const clawd = themeLoader.loadTheme("clawd");
 
-function approx(actual, expected, epsilon = 0.01) {
+function approx(actual, expected, epsilon = 0.01, label = "") {
   assert.ok(
     Math.abs(actual - expected) <= epsilon,
-    `expected ${actual} to be within ${epsilon} of ${expected}`
+    `${label ? `${label}: ` : ""}expected ${actual} to be within ${epsilon} of ${expected}`
   );
 }
 
@@ -31,6 +31,24 @@ function visibleContentRect(theme, artRect) {
 
 describe("hit geometry", () => {
   const bounds = { x: 0, y: 0, width: 200, height: 200 };
+
+  it("keeps working eye-tracking fallback geometry unchanged during executing", () => {
+    const theme = { viewBox: { x: 0, y: 0, width: 100, height: 100 },
+      states: { idle: ["idle.svg"], working: ["working.svg"] },
+      eyeTracking: { enabled: true, states: ["working"] },
+      objectScale: { widthRatio: 1, heightRatio: 1, imgWidthRatio: 0.5, imgBottom: 0.1 },
+    };
+    const hitBox = { x: 10, y: 20, w: 60, h: 50 };
+    assert.equal(hitGeometry.usesObjectChannel(theme, "executing", "working.svg"), true);
+    assert.deepStrictEqual(hitGeometry.getAssetRectScreen(theme, bounds, "executing", "working.svg"),
+      hitGeometry.getAssetRectScreen(theme, bounds, "working", "working.svg"));
+    assert.deepStrictEqual(hitGeometry.getHitRectScreen(theme, bounds, "executing", "working.svg", hitBox),
+      hitGeometry.getHitRectScreen(theme, bounds, "working", "working.svg", hitBox));
+    theme.states.executing = ["own.svg"];
+    assert.equal(hitGeometry.usesObjectChannel(theme, "executing", "own.svg"), false);
+    theme.eyeTracking.states = ["executing"];
+    assert.equal(hitGeometry.usesObjectChannel(theme, "executing", "own.svg"), true);
+  });
 
   it("matches bottom-anchored SVG layout for calico idle", () => {
     const rect = hitGeometry.getAssetRectScreen(calico, bounds, "idle", "calico-idle-follow.svg");
@@ -110,22 +128,15 @@ describe("hit geometry", () => {
     approx(rect.h, 261);
   });
 
-  it("keeps Clawd sleep and thinking geometry and hit regions identical across OBJECT and IMG", () => {
+  it("keeps Clawd object-channel geometry and hit regions identical across OBJECT and IMG", () => {
     const imageTheme = structuredClone(clawd);
-    imageTheme.rendering.objectChannelFiles = imageTheme.rendering.objectChannelFiles
-      .filter((file) => ![
-        "clawd-collapse-sleep.svg",
-        "clawd-sleeping.svg",
-        "clawd-working-thinking.svg",
-      ].includes(file));
+    imageTheme.rendering.objectChannelFiles = [];
+    imageTheme.eyeTracking = { ...(imageTheme.eyeTracking || {}), enabled: false, states: [] };
 
-    for (const [state, file] of [
-      ["collapsing", "clawd-collapse-sleep.svg"],
-      ["sleeping", "clawd-sleeping.svg"],
-      ["thinking", "clawd-working-thinking.svg"],
-      ["working", "clawd-working-thinking.svg"],
-      ["juggling", "clawd-working-thinking.svg"],
-    ]) {
+    const files = clawd.rendering.objectChannelFiles;
+    assert.ok(files.length > 0, "Clawd declares object-channel files");
+    for (const file of files) {
+      const state = file.startsWith("clawd-mini-") ? "mini-idle" : null;
       assert.strictEqual(
         hitGeometry.usesObjectChannel(clawd, state, file),
         true,
@@ -139,11 +150,15 @@ describe("hit geometry", () => {
 
       const objectAsset = hitGeometry.getAssetRectScreen(clawd, bounds, state, file);
       const imageAsset = hitGeometry.getAssetRectScreen(imageTheme, bounds, state, file);
-      assert.deepStrictEqual(objectAsset, imageAsset, `${file} asset geometry changed`);
+      for (const key of ["x", "y", "w", "h"]) {
+        approx(objectAsset[key], imageAsset[key], 1e-9, `${file} asset.${key}`);
+      }
 
       const objectHit = hitGeometry.getHitRectScreen(clawd, bounds, state, file, clawd.hitBoxes.default);
       const imageHit = hitGeometry.getHitRectScreen(imageTheme, bounds, state, file, imageTheme.hitBoxes.default);
-      assert.deepStrictEqual(objectHit, imageHit, `${file} hit geometry changed`);
+      for (const key of ["left", "top", "right", "bottom"]) {
+        approx(objectHit[key], imageHit[key], 1e-9, `${file} hit.${key}`);
+      }
     }
   });
 
