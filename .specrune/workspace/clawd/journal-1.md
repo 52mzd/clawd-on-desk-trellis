@@ -1310,3 +1310,43 @@ fork 的更新链路已指向 52mzd/clawd-on-desk-trellis（v1.2.0-trellis.1.3 �
 4. `test/winget-arch-contract.test.js` → owner/repo 断言
 不改的官方引用（有意保留）：settings-ipc About repoUrl、Discord RPC 素材 URL、Telegram 文档链接、winget 管道脚本。
 版本号语义保持 `1.2.0-trellis.x` pre-release 线；旧版(≤1.2)用户需手动装 1.3 完成渠道切换，勿在旧版里点检查更新。
+
+
+## Session 51: 同步上游 v1.5.0 并发布 v1.5.0-trellis.1.0
+<!-- trellis-session: v=2 fp=4046a718a6272bcf -->
+
+**Date**: 2026-11-07
+**Task**: 同步上游 v1.5.0 并发布 v1.5.0-trellis.1.0
+**Branch**: `main`
+
+### Summary
+
+先把上一会话遗留的 .trellis→.specrune 迁移收尾提交（fab415d6）；再合并上游 v1.4.0/v1.5.0 的 262 个提交（16 处冲突，保留 fork 发布仓库、pre-release 版本、HUD 字号与 Trellis 功能），修掉合并引入的五处回归并全量测试通过；补两位上游作者映射、生成 release note，推送 fork main 并发布 v1.5.0-trellis.1.0。macOS runner 两次排队 15 分钟后被取消，改为本地 ad-hoc 构建 arm64/x64，Linux/Windows 用 attach-release-artifacts 在 runner 内转传，校验 sha256 后发布并标记 latest。
+
+### Main Changes
+
+- 提交 .specrune 迁移（pi 扩展/提示词替换、.gitattributes 改指 specrune journal）
+- 合并 origin/main 262 提交，冲突按 fork 值/上游新增并存裁决
+- 修复 trellisChipInfo 测试沙箱缺失、恢复 Trellis 复用的 .agent-badge 样式、HUD tagged-fallback 宽度按 14px 字号加到 112
+- 本地 tracked tree 因迁移涨到 69.6MB，硬阈值 64→68MiB
+- 补 sunfleeting-debug / du-xinyi 作者映射并重生成贡献墙
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `50bf251e` | chore(sync): 合并上游 v1.5.0（设置五页重构、APT 更新、手机独立配对） |
+
+### Testing
+
+- [OK] npm test：15984 用例 15888 pass / 0 fail / 96 skip
+- [OK] npm run verify:release：版本契约 + 11 位外部贡献者通过
+- [OK] 发布资产 sha256 与本地构建逐项一致；codesign --verify 通过；koffi 按 arch 裁剪正确
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- macOS runner 连续取消，test.yml 的 macos 任务仍为红；配额恢复后重跑该任务

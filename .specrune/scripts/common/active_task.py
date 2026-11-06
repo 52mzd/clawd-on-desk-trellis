@@ -20,7 +20,7 @@ from typing import Any
 
 from .io import read_json as _io_read_json, write_json as _io_write_json
 
-DIR_WORKFLOW = ".trellis"
+DIR_WORKFLOW = ".specrune"
 DIR_TASKS = "tasks"
 DIR_RUNTIME = ".runtime"
 DIR_SESSIONS = "sessions"

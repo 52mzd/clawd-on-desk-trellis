@@ -25,7 +25,7 @@ from .git import main_worktree_root
 # =============================================================================
 
 # Directory names
-DIR_WORKFLOW = ".trellis"
+DIR_WORKFLOW = ".specrune"
 DIR_WORKSPACE = "workspace"
 DIR_TASKS = "tasks"
 DIR_ARCHIVE = "archive"
